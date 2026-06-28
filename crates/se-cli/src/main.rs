@@ -7,6 +7,7 @@
 
 mod ingest;
 mod leak_test;
+mod nightly;
 mod sanity;
 mod search_cmd;
 mod signals_cmd;
@@ -61,6 +62,8 @@ enum Cmd {
     Promote(PromoteArgs),
     /// (P7) Generate + print current executable signals from promoted strategies.
     Signals(SignalsArgs),
+    /// Run the full nightly walk-forward loop once (ingest→search→signals→journal→monitor→changelog).
+    Nightly(nightly::NightlyArgs),
 }
 
 #[derive(Args)]
@@ -184,6 +187,7 @@ async fn main() -> Result<()> {
         Cmd::Signals(args) => {
             signals_cmd::run_signals(&cfg, args.horizon, args.journal).await?;
         }
+        Cmd::Nightly(args) => nightly::run(&cfg, args).await?,
     }
     Ok(())
 }

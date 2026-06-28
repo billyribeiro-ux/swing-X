@@ -1,0 +1,135 @@
+//! `se nightly` — execute the nightly walk-forward loop (§0) once.
+//!
+//! Runs the canonical [`se_orchestrator::NIGHTLY`] job graph against the live store and
+//! ML worker (ingest, search, signals, journal, monitor, changelog). Idempotent (upserts),
+//! resumable (each step is independent), and logged. In production a cron/apalis schedule
+//! fires this after the close; here it runs on demand.
+//!
+//! Note: the search step materializes per-bar features across the universe and validates
+//! candidates on the ML worker, so a full multi-month history is a genuine batch job.
+
+use anyhow::{bail, Context, Result};
+use chrono::{Duration, Utc};
+
+use se_config::AppConfig;
+use se_orchestrator::{Step, NIGHTLY};
+use se_provider::{FmpProvider, FredProvider, MockProvider};
+use se_store::Store;
+
+use crate::{ingest, search_cmd, signals_cmd};
+
+#[derive(clap::Args)]
+pub struct NightlyArgs {
+    /// `fmp` or `mock`. Defaults to `fmp` when FMP_API_KEY is configured, else `mock`.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Generations to evolve in the search step.
+    #[arg(long, default_value_t = 2)]
+    pub generations: u32,
+    /// Genomes evaluated per generation.
+    #[arg(long, default_value_t = 12)]
+    pub per_gen: usize,
+    /// Days of history to ingest + search over (multi-regime history needs ~500+).
+    #[arg(long, default_value_t = 540)]
+    pub history_days: i64,
+    /// Horizon override (P8 axis). Defaults to SE_HORIZON / config.
+    #[arg(long)]
+    pub horizon: Option<String>,
+}
+
+pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
+    let store = Store::connect(&cfg.database_url)
+        .await
+        .context("connect db")?;
+    store.migrate().await.context("migrate")?;
+
+    let chosen = args
+        .provider
+        .clone()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if cfg.fmp_configured {
+                "fmp".into()
+            } else {
+                "mock".into()
+            }
+        });
+
+    let to = Utc::now().date_naive();
+    let from = to - Duration::days(args.history_days.max(1));
+
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!(
+        " se nightly │ provider={} │ horizon={} │ history {} → {}",
+        chosen,
+        cfg.horizon.horizon.as_str(),
+        from,
+        to
+    );
+    println!(" loop: {}", NIGHTLY.map(|s| s.label()).join(" → "));
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+
+    for step in NIGHTLY {
+        println!("\n▌ {} — {}", step.label(), step.detail());
+        match step {
+            Step::Ingest => match chosen.as_str() {
+                "fmp" => {
+                    let fmp = FmpProvider::from_env().context("init FMP")?;
+                    let fred = FredProvider::from_env();
+                    let n =
+                        ingest::ingest_bars(&store, &fmp, "fmp", &cfg.universe, from, to).await?;
+                    let rep =
+                        ingest::ingest_macro(&store, Some(&fmp), Some(&fred), from, to).await?;
+                    println!("  ingested {n} bar-rows │ {}", rep.summary_line());
+                }
+                "mock" => {
+                    let mock = MockProvider;
+                    let n =
+                        ingest::ingest_bars(&store, &mock, "mock", &cfg.universe, from, to).await?;
+                    let rep = ingest::ingest_macro_via(&store, &mock, from, to).await?;
+                    println!("  ingested {n} bar-rows │ {}", rep.summary_line());
+                }
+                other => bail!("unknown provider '{other}'"),
+            },
+            Step::Search => {
+                search_cmd::run_search(
+                    cfg,
+                    args.generations,
+                    args.per_gen,
+                    args.horizon.clone(),
+                    Some(from.to_string()),
+                    Some(to.to_string()),
+                    false,
+                )
+                .await?;
+            }
+            Step::Signals => {
+                signals_cmd::run_signals(cfg, args.horizon.clone(), false).await?;
+            }
+            Step::Journal => {
+                // Journaling is performed inline by `signals --journal`; in the nightly
+                // loop we resolve open paper trades against the freshly-ingested bars.
+                signals_cmd::run_signals(cfg, args.horizon.clone(), true).await?;
+            }
+            Step::Monitor => {
+                let report = se_monitor::run_daily(&store).await?;
+                println!(
+                    "  monitor fired {} event(s) [divergence={} drawdown={} calibration={} staleness={} ood={}]",
+                    report.total(),
+                    report.divergence,
+                    report.drawdown,
+                    report.calibration,
+                    report.staleness,
+                    report.regime_ood,
+                );
+            }
+            Step::Changelog => {
+                let week = se_monitor::weekly_changelog(&store).await?;
+                println!("  weekly changelog written for week of {week}");
+            }
+        }
+    }
+
+    println!("\n✓ nightly loop complete");
+    Ok(())
+}

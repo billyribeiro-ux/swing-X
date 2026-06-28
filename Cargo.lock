@@ -2525,6 +2525,8 @@ dependencies = [
  "se-features",
  "se-journal",
  "se-mlclient",
+ "se-monitor",
+ "se-orchestrator",
  "se-provider",
  "se-regime",
  "se-search",

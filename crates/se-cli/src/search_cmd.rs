@@ -95,10 +95,12 @@ pub async fn run_search(
         "ranking key: OUT-OF-SAMPLE ONLY (oos_expectancy, dsr) — in-sample fit is never ranked."
     );
 
-    print!("materializing feature windows across the universe ... ");
+    println!("materializing per-bar feature windows across the universe (one-time) ...");
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
     let manager = PopulationManager::new(&store, &harness, search_cfg.clone()).await?;
     println!(
-        "done ({} features in catalog, {} windows)",
+        "  done: {} features in catalog, {} windows",
         manager.catalog().len(),
         manager.windows().len()
     );

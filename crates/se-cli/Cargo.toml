@@ -22,6 +22,8 @@ se-validation = { path = "../se-validation" }
 se-search = { path = "../se-search" }
 se-signal = { path = "../se-signal" }
 se-journal = { path = "../se-journal" }
+se-monitor = { path = "../se-monitor" }
+se-orchestrator = { path = "../se-orchestrator" }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
