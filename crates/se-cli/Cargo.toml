@@ -19,6 +19,9 @@ se-features = { path = "../se-features" }
 se-regime = { path = "../se-regime" }
 se-mlclient = { path = "../se-mlclient" }
 se-validation = { path = "../se-validation" }
+se-search = { path = "../se-search" }
+se-signal = { path = "../se-signal" }
+se-journal = { path = "../se-journal" }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

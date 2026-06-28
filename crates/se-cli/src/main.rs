@@ -8,6 +8,8 @@
 mod ingest;
 mod leak_test;
 mod sanity;
+mod search_cmd;
+mod signals_cmd;
 
 use std::collections::HashMap;
 
@@ -53,6 +55,64 @@ enum Cmd {
     InjectLeakTest,
     /// (P2) Cross-check regime labels against known historical events.
     RegimeSanityCheck,
+    /// (P5) Run the genome search/mutation loop on the OOS scoreboard.
+    Search(SearchArgs),
+    /// (P5) Print the full promotion-gate evaluation for top candidates (runs a short search).
+    Promote(PromoteArgs),
+    /// (P7) Generate + print current executable signals from promoted strategies.
+    Signals(SignalsArgs),
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    /// Number of generations to evolve.
+    #[arg(long, default_value_t = 2)]
+    generations: u32,
+    /// Genomes evaluated per generation.
+    #[arg(long, default_value_t = 12)]
+    per_gen: usize,
+    /// Provider hint (accepted for parity with `scan`; search reads from the store).
+    #[arg(long)]
+    provider: Option<String>,
+    /// Horizon override (e.g. `swing`, `day`). Defaults to SE_HORIZON / config (P8 axis).
+    #[arg(long)]
+    horizon: Option<String>,
+    /// Inclusive window start (YYYY-MM-DD). Default: 730 days before `to`.
+    #[arg(long)]
+    from: Option<String>,
+    /// Inclusive window end (YYYY-MM-DD). Default: today.
+    #[arg(long)]
+    to: Option<String>,
+}
+
+#[derive(Args)]
+struct PromoteArgs {
+    /// Print the gate without persisting promotions beyond the search itself.
+    #[arg(long, default_value_t = true)]
+    dry_run: bool,
+    #[arg(long, default_value_t = 2)]
+    generations: u32,
+    #[arg(long, default_value_t = 12)]
+    per_gen: usize,
+    #[arg(long)]
+    horizon: Option<String>,
+    #[arg(long)]
+    from: Option<String>,
+    #[arg(long)]
+    to: Option<String>,
+}
+
+#[derive(Args)]
+struct SignalsArgs {
+    /// Provider hint (accepted for parity; signals read from the store).
+    #[arg(long)]
+    provider: Option<String>,
+    /// Horizon override (P8 axis). Defaults to SE_HORIZON / config.
+    #[arg(long)]
+    horizon: Option<String>,
+    /// Also open + resolve a paper trade per signal and print the realized fill.
+    #[arg(long, default_value_t = false)]
+    journal: bool,
 }
 
 #[derive(Args)]
@@ -96,6 +156,33 @@ async fn main() -> Result<()> {
                 .context("connect db")?;
             store.migrate().await.context("migrate")?;
             sanity::run(&store, &[Ticker::Spy, Ticker::Qqq]).await?;
+        }
+        Cmd::Search(args) => {
+            search_cmd::run_search(
+                &cfg,
+                args.generations,
+                args.per_gen,
+                args.horizon,
+                args.from,
+                args.to,
+                false,
+            )
+            .await?;
+        }
+        Cmd::Promote(args) => {
+            search_cmd::run_search(
+                &cfg,
+                args.generations,
+                args.per_gen,
+                args.horizon,
+                args.from,
+                args.to,
+                args.dry_run,
+            )
+            .await?;
+        }
+        Cmd::Signals(args) => {
+            signals_cmd::run_signals(&cfg, args.horizon, args.journal).await?;
         }
     }
     Ok(())

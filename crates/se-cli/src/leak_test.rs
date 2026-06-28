@@ -54,13 +54,27 @@ pub async fn run() -> Result<()> {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let leaky = harness
-        .evaluate(&leaky_dataset(2), &profile, "leak_leaky.parquet", N_GROUPS, K_TEST_GROUPS, N_TRIALS)
+        .evaluate(
+            &leaky_dataset(2),
+            &profile,
+            "leak_leaky.parquet",
+            N_GROUPS,
+            K_TEST_GROUPS,
+            N_TRIALS,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("leaky validation failed: {e}"))?;
     print_row("LEAKY", &leaky);
 
     let genuine = harness
-        .evaluate(&genuine_edge_dataset(0), &profile, "leak_genuine.parquet", N_GROUPS, K_TEST_GROUPS, N_TRIALS)
+        .evaluate(
+            &genuine_edge_dataset(0),
+            &profile,
+            "leak_genuine.parquet",
+            N_GROUPS,
+            K_TEST_GROUPS,
+            N_TRIALS,
+        )
         .await
         .map_err(|e| anyhow::anyhow!("genuine validation failed: {e}"))?;
     print_row("GENUINE", &genuine);

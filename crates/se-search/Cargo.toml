@@ -8,3 +8,20 @@ publish = false
 
 [dependencies]
 se-core = { path = "../se-core" }
+se-store = { path = "../se-store" }
+se-features = { path = "../se-features" }
+se-labeler = { path = "../se-labeler" }
+se-mlclient = { path = "../se-mlclient" }
+se-validation = { path = "../se-validation" }
+se-regime = { path = "../se-regime" }
+se-provider = { path = "../se-provider" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+se-config = { path = "../se-config" }

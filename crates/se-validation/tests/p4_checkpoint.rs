@@ -52,7 +52,14 @@ async fn p4_checkpoint_leak_rejected_genuine_passes() {
     // --- (b) LEAKY dataset: must be REJECTED ---
     let leaky = leaky_dataset(2);
     let leaky_out = harness
-        .evaluate(&leaky, &profile, "p4_leaky.parquet", N_GROUPS, K_TEST_GROUPS, N_TRIALS)
+        .evaluate(
+            &leaky,
+            &profile,
+            "p4_leaky.parquet",
+            N_GROUPS,
+            K_TEST_GROUPS,
+            N_TRIALS,
+        )
         .await
         .expect("leaky validation call failed");
     println!(
@@ -68,7 +75,14 @@ async fn p4_checkpoint_leak_rejected_genuine_passes() {
     // --- (a) GENUINE-EDGE dataset: must PASS ---
     let genuine = genuine_edge_dataset(0);
     let genuine_out = harness
-        .evaluate(&genuine, &profile, "p4_genuine.parquet", N_GROUPS, K_TEST_GROUPS, N_TRIALS)
+        .evaluate(
+            &genuine,
+            &profile,
+            "p4_genuine.parquet",
+            N_GROUPS,
+            K_TEST_GROUPS,
+            N_TRIALS,
+        )
         .await
         .expect("genuine validation call failed");
     println!(
@@ -93,7 +107,9 @@ async fn p4_checkpoint_leak_rejected_genuine_passes() {
     assert!(
         v.oos_expectancy_cost_aware <= 0.0 || v.dsr <= 0.5 || v.pbo >= 0.5,
         "leak OOS-collapse signature expected, got dsr={} pbo={} oos_exp={}",
-        v.dsr, v.pbo, v.oos_expectancy_cost_aware
+        v.dsr,
+        v.pbo,
+        v.oos_expectancy_cost_aware
     );
 
     // Genuine edge MUST pass (proves the harness discriminates, not rejects-everything).

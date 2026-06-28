@@ -57,7 +57,12 @@ impl Predicate {
     }
 
     pub fn describe(&self) -> String {
-        format!("{} {} {:.4}", self.feature_key, self.op.as_str(), self.threshold)
+        format!(
+            "{} {} {:.4}",
+            self.feature_key,
+            self.op.as_str(),
+            self.threshold
+        )
     }
 }
 
@@ -91,7 +96,10 @@ impl Genome {
 
     /// The set of feature keys this genome reads (for attribution + decay monitoring).
     pub fn feature_keys(&self) -> Vec<&str> {
-        self.predicates.iter().map(|p| p.feature_key.as_str()).collect()
+        self.predicates
+            .iter()
+            .map(|p| p.feature_key.as_str())
+            .collect()
     }
 
     pub fn describe(&self) -> String {

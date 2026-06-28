@@ -136,7 +136,11 @@ impl Signal {
              Conviction: {:.2} (calibrated, regime-matched cohort n={})\nRegime: {}\nWhy: {}\n\
              Invalidation: {}\nExpectancy(cohort): {:+.2}R   CVaR(5%): {:.1}R   Lead-time: {}",
             self.ticker,
-            if self.side == Side::Long { "LONG" } else { "SHORT" },
+            if self.side == Side::Long {
+                "LONG"
+            } else {
+                "SHORT"
+            },
             self.horizon.as_str(),
             self.entry,
             self.stop,

@@ -1,0 +1,387 @@
+//! [`PopulationManager`] — the search/mutation loop on the OOS scoreboard.
+//!
+//! One generation: SEARCH (the current population of genomes) -> FIT (in-sample, done
+//! implicitly inside the worker's CPCV) -> SCORE (out-of-sample, the ONLY ranking input) ->
+//! KEEP survivors (gate-pass OR positive cost-aware OOS expectancy with a clean overfit
+//! signature) / MUTATE the promising ones / KILL the rest. Survivors and scores are persisted
+//! every generation so a crash leaves a usable scoreboard.
+//!
+//! Tiny-dataset safety: a genome that produces too few labeled entries to validate is logged
+//! and skipped — never a crash, never a fabricated score.
+
+use std::collections::BTreeMap;
+
+use futures::StreamExt;
+use se_core::{Genome, HorizonProfile, Result, Strategy, StrategyId, StrategyStatus, Ticker};
+use se_store::Store;
+use se_validation::ValidationHarness;
+
+use crate::backtest::{assemble, backtest};
+use crate::feature_matrix::{build_window, FeatureWindow};
+use crate::rng::Rng;
+use crate::score::{score_oos, OosScore, ScoreConfig, MIN_ENTRIES_TO_VALIDATE};
+use crate::seed::{seed_population, FeatureCatalog};
+use crate::{genome_ops, persist};
+
+/// One evaluated member of the population: its strategy identity, genome, and (if it had enough
+/// data) its OOS score.
+#[derive(Debug, Clone)]
+pub struct Evaluated {
+    pub strategy: Strategy,
+    pub score: Option<OosScore>,
+    /// Number of labeled entries the genome produced across the universe (cohort size).
+    pub n_entries: usize,
+}
+
+impl Evaluated {
+    /// Whether this member survives into the next generation.
+    pub fn survives(&self) -> bool {
+        self.score
+            .as_ref()
+            .map(|s| s.is_survivor())
+            .unwrap_or(false)
+    }
+
+    /// Whether this member is promotable (hard gate passed).
+    pub fn promotable(&self) -> bool {
+        self.score.as_ref().map(|s| s.passed_gate).unwrap_or(false)
+    }
+}
+
+/// Configuration for the search loop.
+#[derive(Debug, Clone)]
+pub struct SearchConfig {
+    /// Active horizon profile (drives barriers, costs, cadence — the P8 axis).
+    pub profile: HorizonProfile,
+    /// Universe of tickers to backtest each genome across.
+    pub universe: Vec<Ticker>,
+    /// Window start/end (decision bars).
+    pub from: chrono::DateTime<chrono::Utc>,
+    pub to: chrono::DateTime<chrono::Utc>,
+    /// Base RNG seed (mixed with generation). Deterministic search.
+    pub base_seed: u64,
+    /// Max predicates per seeded genome.
+    pub max_predicates: usize,
+    /// Minimum observations required for a feature to enter the catalog.
+    pub min_feature_obs: usize,
+    /// OOS scoring shape.
+    pub score: ScoreConfig,
+}
+
+/// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
+pub const DEFAULT_SEARCH_SEED: u64 = 0x0005_EED0_F5EA_C401;
+
+impl SearchConfig {
+    pub fn new(profile: HorizonProfile, universe: Vec<Ticker>) -> Self {
+        let to = chrono::Utc::now();
+        let from = to - chrono::Duration::days(730);
+        SearchConfig {
+            profile,
+            universe,
+            from,
+            to,
+            base_seed: DEFAULT_SEARCH_SEED,
+            max_predicates: 3,
+            min_feature_obs: 30,
+            score: ScoreConfig::default(),
+        }
+    }
+}
+
+/// The population manager: owns the store, the validation harness, and the search config.
+pub struct PopulationManager<'a> {
+    store: &'a Store,
+    harness: &'a ValidationHarness,
+    cfg: SearchConfig,
+    /// Materialized feature windows per ticker (computed once, reused every generation).
+    windows: Vec<FeatureWindow>,
+    catalog: FeatureCatalog,
+}
+
+impl<'a> PopulationManager<'a> {
+    /// Construct and materialize the feature windows for the universe. This is the expensive,
+    /// one-time step (per-bar feature computation across the window).
+    pub async fn new(
+        store: &'a Store,
+        harness: &'a ValidationHarness,
+        cfg: SearchConfig,
+    ) -> Result<Self> {
+        // Build each ticker's window concurrently (each is independent and I/O-bound).
+        let built: Vec<FeatureWindow> = futures::stream::iter(cfg.universe.clone())
+            .map(|t| build_window(store, t, cfg.from, cfg.to, cfg.profile))
+            .buffer_unordered(4)
+            .collect::<Vec<Result<FeatureWindow>>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<FeatureWindow>>>()?;
+        let mut windows = Vec::new();
+        for w in built {
+            if w.points.is_empty() {
+                tracing::warn!(ticker = %w.ticker, "no decision bars in window; skipping");
+                continue;
+            }
+            windows.push(w);
+        }
+        let catalog = FeatureCatalog::from_windows(&windows, cfg.min_feature_obs);
+        Ok(PopulationManager {
+            store,
+            harness,
+            cfg,
+            windows,
+            catalog,
+        })
+    }
+
+    /// The feature catalog the search draws from (observed keys + quantiles).
+    pub fn catalog(&self) -> &FeatureCatalog {
+        &self.catalog
+    }
+
+    /// The materialized windows (for diagnostics / signal generation reuse).
+    pub fn windows(&self) -> &[FeatureWindow] {
+        &self.windows
+    }
+
+    /// Backtest a genome across the whole universe and assemble one combined dataset (entries
+    /// from all tickers, re-sorted ascending by entry time as the writer requires).
+    fn build_dataset(&self, genome: &Genome) -> (Vec<se_mlclient::DatasetRow>, usize) {
+        let mut all = Vec::new();
+        for w in &self.windows {
+            let res = backtest(genome, w, &self.cfg.profile);
+            let rows = assemble(&res);
+            all.extend(rows);
+        }
+        all.sort_by(|a, b| a.ts.cmp(&b.ts));
+        let n = all.len();
+        (all, n)
+    }
+
+    /// Evaluate one genome end-to-end: backtest -> assemble -> OOS score. Tiny datasets return
+    /// `Ok(Evaluated{score: None})` (logged, skipped) rather than erroring.
+    async fn evaluate_genome(&self, strategy: Strategy) -> Result<Evaluated> {
+        let (rows, n_entries) = self.build_dataset(&strategy.genome);
+        if n_entries < MIN_ENTRIES_TO_VALIDATE {
+            tracing::info!(
+                strategy = %strategy.id,
+                n_entries,
+                min = MIN_ENTRIES_TO_VALIDATE,
+                "too few labeled entries to validate; skipping genome"
+            );
+            return Ok(Evaluated {
+                strategy,
+                score: None,
+                n_entries,
+            });
+        }
+        // A per-genome validation error (e.g. the worker's 422 "no OOS observations produced by
+        // CPCV" for a thin/degenerate cohort) must NOT abort the whole search — log and skip that
+        // genome. A genuinely-down worker is caught up front by the CLI's health probe.
+        let score = match score_oos(
+            self.harness,
+            strategy.id,
+            &rows,
+            &self.cfg.profile,
+            self.cfg.score,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(strategy = %strategy.id, n_entries, error = %e, "OOS scoring failed for genome; skipping");
+                None
+            }
+        };
+        Ok(Evaluated {
+            strategy,
+            score,
+            n_entries,
+        })
+    }
+
+    /// Persist a strategy and (if scored) its OOS score.
+    async fn persist(&self, ev: &Evaluated) -> Result<()> {
+        persist::upsert_strategy(self.store, &ev.strategy).await?;
+        if let Some(score) = &ev.score {
+            let fold_spec = serde_json::json!({
+                "n_groups": self.cfg.score.n_groups,
+                "k_test_groups": self.cfg.score.k_test_groups,
+                "n_trials": self.cfg.score.n_trials,
+                "embargo_bars": self.cfg.profile.embargo_bars,
+                "purge": true,
+                // Cohort size (entry count) so signal generation can report a real `cohort_n`
+                // without re-backtesting.
+                "n_entries": ev.n_entries,
+            });
+            persist::insert_oos_score(self.store, score, &fold_spec).await?;
+        }
+        Ok(())
+    }
+
+    /// Run the search for `generations` generations with `per_gen` genomes per generation.
+    /// Returns the final evaluated population (sorted best-first by OOS), and the cumulative
+    /// best scores seen. Persists strategies + scores every generation.
+    pub async fn evolve(&self, generations: u32, per_gen: usize) -> Result<EvolveOutcome> {
+        if self.catalog.is_empty() {
+            return Err(se_core::Error::msg(
+                "no features observed in the window — cannot seed a population (run `se scan` first)",
+            ));
+        }
+
+        let mut all_evaluated: Vec<Evaluated> = Vec::new();
+        let mut survivors: Vec<Genome> = Vec::new();
+
+        for gen in 0..generations {
+            let mut rng = Rng::seeded(self.cfg.base_seed, gen);
+
+            // Build this generation's genomes: survivors + their mutations/crossovers, topped up
+            // with fresh seeds to `per_gen`.
+            let genomes = self.next_generation(&survivors, per_gen, &mut rng);
+
+            tracing::info!(generation = gen, n = genomes.len(), "evaluating generation");
+
+            let mut evaluated: Vec<Evaluated> = Vec::new();
+            for genome in genomes {
+                let mut strategy = Strategy::new(genome);
+                strategy.generation = gen;
+                let ev = self.evaluate_genome(strategy).await?;
+                self.persist(&ev).await?;
+                evaluated.push(ev);
+            }
+
+            // KEEP survivors, MUTATE-promising for next gen; KILL rest (status update).
+            survivors = self.select_survivors(&evaluated).await?;
+            all_evaluated.extend(evaluated);
+        }
+
+        // Final leaderboard: best OOS first. De-dup by strategy id (keep best score).
+        all_evaluated.sort_by(|a, b| match (&a.score, &b.score) {
+            (Some(sa), Some(sb)) => sa.cmp_best_first(sb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+
+        Ok(EvolveOutcome {
+            evaluated: all_evaluated,
+            profile: self.cfg.profile,
+        })
+    }
+
+    /// Assemble the next generation's genomes from survivors + fresh seeds.
+    fn next_generation(&self, survivors: &[Genome], per_gen: usize, rng: &mut Rng) -> Vec<Genome> {
+        let mut genomes: Vec<Genome> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        let push =
+            |g: Genome, seen: &mut std::collections::BTreeSet<String>, out: &mut Vec<Genome>| {
+                if seen.insert(g.describe()) {
+                    out.push(g);
+                }
+            };
+
+        // Carry survivors forward (elitism) + their mutations and pairwise crossovers.
+        for g in survivors {
+            push(g.clone(), &mut seen, &mut genomes);
+        }
+        for g in survivors {
+            if genomes.len() >= per_gen {
+                break;
+            }
+            push(
+                genome_ops::mutate(g, &self.catalog, rng),
+                &mut seen,
+                &mut genomes,
+            );
+        }
+        if survivors.len() >= 2 {
+            for pair in survivors.windows(2) {
+                if genomes.len() >= per_gen {
+                    break;
+                }
+                push(
+                    genome_ops::crossover(&pair[0], &pair[1], rng),
+                    &mut seen,
+                    &mut genomes,
+                );
+            }
+        }
+
+        // Top up with fresh seeds.
+        if genomes.len() < per_gen {
+            let need = per_gen - genomes.len();
+            let fresh = seed_population(
+                &self.catalog,
+                self.cfg.profile.horizon,
+                need * 2,
+                rng,
+                self.cfg.max_predicates,
+            );
+            for g in fresh {
+                if genomes.len() >= per_gen {
+                    break;
+                }
+                push(g, &mut seen, &mut genomes);
+            }
+        }
+
+        genomes.truncate(per_gen);
+        genomes
+    }
+
+    /// Apply the survivor rule, update DB statuses, and return the surviving genomes for the
+    /// next generation. Promotable strategies become `Promoted`; non-survivors become `Retired`.
+    async fn select_survivors(&self, evaluated: &[Evaluated]) -> Result<Vec<Genome>> {
+        let mut survivors = Vec::new();
+        for ev in evaluated {
+            if ev.promotable() {
+                persist::update_status(self.store, ev.strategy.id, StrategyStatus::Promoted)
+                    .await?;
+                survivors.push(ev.strategy.genome.clone());
+            } else if ev.survives() {
+                // Keep as candidate (already persisted as candidate); carry forward to mutate.
+                survivors.push(ev.strategy.genome.clone());
+            } else if ev.score.is_some() {
+                // Scored but failed the survivor rule -> retire.
+                persist::update_status(self.store, ev.strategy.id, StrategyStatus::Retired).await?;
+            }
+            // Unscored (tiny dataset) strategies stay `candidate` but are not carried forward.
+        }
+        Ok(survivors)
+    }
+}
+
+/// The outcome of an `evolve` run.
+#[derive(Debug, Clone)]
+pub struct EvolveOutcome {
+    /// All evaluated members across all generations, sorted best-first by OOS score.
+    pub evaluated: Vec<Evaluated>,
+    /// The horizon profile the search ran under (for leaderboard labeling — P8).
+    pub profile: HorizonProfile,
+}
+
+impl EvolveOutcome {
+    /// The top `n` scored members (skips unscored/tiny-dataset members).
+    pub fn leaderboard(&self, n: usize) -> Vec<&Evaluated> {
+        self.evaluated
+            .iter()
+            .filter(|e| e.score.is_some())
+            .take(n)
+            .collect()
+    }
+
+    /// Count of promotable (gate-passing) members.
+    pub fn n_promoted(&self) -> usize {
+        self.evaluated.iter().filter(|e| e.promotable()).count()
+    }
+
+    /// Per-strategy id -> best score map (for downstream lookups).
+    pub fn best_scores(&self) -> BTreeMap<StrategyId, &OosScore> {
+        let mut m = BTreeMap::new();
+        for e in &self.evaluated {
+            if let Some(s) = &e.score {
+                m.entry(e.strategy.id).or_insert(s);
+            }
+        }
+        m
+    }
+}
