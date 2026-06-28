@@ -8,3 +8,13 @@ publish = false
 
 [dependencies]
 se-core = { path = "../se-core" }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

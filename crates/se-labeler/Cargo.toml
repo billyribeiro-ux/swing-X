@@ -8,3 +8,6 @@ publish = false
 
 [dependencies]
 se-core = { path = "../se-core" }
+se-mlclient = { path = "../se-mlclient" }
+chrono = { workspace = true }
+serde = { workspace = true }
