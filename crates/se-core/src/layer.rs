@@ -12,15 +12,22 @@ use crate::error::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Layer {
+    // `alias` accepts the legacy PascalCase form so genomes persisted before Layer
+    // adopted snake_case still deserialize. New writes use snake_case (rename_all).
     /// L0 — only scan names with a large hand leaning on them.
+    #[serde(alias = "Tradeability")]
     Tradeability,
     /// L1 — the conditioner: continuation-vs-fade.
+    #[serde(alias = "Regime")]
     Regime,
     /// L2 — where decisions sit.
+    #[serde(alias = "Location")]
     Location,
     /// L3 — who's leaning on arrival.
+    #[serde(alias = "Trigger")]
     Trigger,
     /// Overlay — event modifiers / sizing constraints, never standalone signals.
+    #[serde(alias = "Event")]
     Event,
 }
 
@@ -58,5 +65,25 @@ impl FromStr for Layer {
             .into_iter()
             .find(|l| l.as_str() == low)
             .ok_or_else(|| Error::Parse(format!("unknown layer: {s}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_snake_case_with_legacy_alias() {
+        // Writes are snake_case...
+        assert_eq!(serde_json::to_string(&Layer::Regime).unwrap(), "\"regime\"");
+        // ...reads accept both snake_case and legacy PascalCase (persisted genomes).
+        assert_eq!(
+            serde_json::from_str::<Layer>("\"regime\"").unwrap(),
+            Layer::Regime
+        );
+        assert_eq!(
+            serde_json::from_str::<Layer>("\"Regime\"").unwrap(),
+            Layer::Regime
+        );
     }
 }

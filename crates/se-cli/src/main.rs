@@ -11,6 +11,7 @@ mod nightly;
 mod sanity;
 mod search_cmd;
 mod signals_cmd;
+mod trades;
 
 use std::collections::HashMap;
 
@@ -62,8 +63,23 @@ enum Cmd {
     Promote(PromoteArgs),
     /// (P7) Generate + print current executable signals from promoted strategies.
     Signals(SignalsArgs),
+    /// Replay promoted strategies' backtests and journal the per-trade winners/losers.
+    Trades(TradesArgs),
     /// Run the full nightly walk-forward loop once (ingest→search→signals→journal→monitor→changelog).
     Nightly(nightly::NightlyArgs),
+}
+
+#[derive(Args)]
+struct TradesArgs {
+    /// Horizon override (P8 axis). Defaults to SE_HORIZON / config.
+    #[arg(long)]
+    horizon: Option<String>,
+    /// Inclusive window start (YYYY-MM-DD). Default: 730 days before `to`.
+    #[arg(long)]
+    from: Option<String>,
+    /// Inclusive window end (YYYY-MM-DD). Default: today.
+    #[arg(long)]
+    to: Option<String>,
 }
 
 #[derive(Args)]
@@ -228,6 +244,7 @@ async fn main() -> Result<()> {
         Cmd::Signals(args) => {
             signals_cmd::run_signals(&cfg, args.horizon, args.journal).await?;
         }
+        Cmd::Trades(args) => trades::run(&cfg, args.horizon, args.from, args.to).await?,
         Cmd::Nightly(args) => nightly::run(&cfg, args).await?,
     }
     Ok(())

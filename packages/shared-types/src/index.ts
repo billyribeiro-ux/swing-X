@@ -85,7 +85,7 @@ export const MONITOR_ACTIONS = [
 ] as const;
 export type MonitorAction = (typeof MONITOR_ACTIONS)[number];
 
-export const TRADE_MODES = ['paper', 'live'] as const;
+export const TRADE_MODES = ['paper', 'live', 'backtest'] as const;
 export type TradeMode = (typeof TRADE_MODES)[number];
 
 // ---------------------------------------------------------------------------
