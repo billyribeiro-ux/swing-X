@@ -18,7 +18,8 @@ use se_config::AppConfig;
 use se_core::{AsOf, DecisionTs, Layer, LeadTimeTag, Ticker};
 use se_features::indicators::{dollar_adv, realized_vol};
 use se_features::{
-    FeatureContext, FeatureModule, TradeabilityGate, TradeabilityInput, TradeabilityModule,
+    EventOverlay, FeatureContext, FeatureModule, LocationModule, TradeabilityGate,
+    TradeabilityInput, TradeabilityModule, TriggerModule,
 };
 use se_provider::{
     DataProvider, FmpProvider, FredProvider, MockProvider, NullProprietary, ProviderKind,
@@ -326,6 +327,44 @@ async fn scan(cfg: &AppConfig, args: ScanArgs) -> Result<()> {
     }
     println!(
         "\n{passed}/{} universe names pass the tradeability gate.\n",
+        latest.len()
+    );
+
+    // ---- P3 feature layers: location / trigger / event --------------------
+    // Mirror the layer0/layer1 pipeline: for each ticker's latest decision bar
+    // run the three modules through the PIT-safe FeatureContext and persist their
+    // features. EventOverlay is calendar-only (no leakage); Location/Trigger read
+    // PIT-safe bars (Trigger also reads SPY + the universe via bars_for).
+    let location = LocationModule::new();
+    let trigger = TriggerModule::new();
+    let events = EventOverlay::new();
+    let mut loc_count = 0usize;
+    let mut trig_count = 0usize;
+    let mut evt_count = 0usize;
+    for &t in &cfg.universe {
+        let Some(&last_ts) = latest.get(&t) else {
+            continue;
+        };
+        let decision = DecisionTs::new(last_ts);
+        let pit = store.pit(t, decision);
+        let ctx = FeatureContext::new(&pit, &prop, cfg.horizon);
+
+        for (module, counter) in [
+            (&location as &dyn FeatureModule, &mut loc_count),
+            (&trigger as &dyn FeatureModule, &mut trig_count),
+            (&events as &dyn FeatureModule, &mut evt_count),
+        ] {
+            let feats = module.compute(&ctx).await?;
+            let writes: Vec<FeatureWrite> = feats
+                .iter()
+                .map(|f| FeatureWrite::from_feature(t, decision, f))
+                .collect();
+            store.insert_features(&writes).await?;
+            *counter += writes.len();
+        }
+    }
+    println!(
+        "P3 feature layers @ latest bar: location={loc_count} │ trigger={trig_count} │ event={evt_count} (across {} names)\n",
         latest.len()
     );
 

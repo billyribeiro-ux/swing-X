@@ -163,6 +163,89 @@ pub fn adx(bars: &[Bar], period: usize) -> Option<f64> {
     Some(adx)
 }
 
+/// Wilder's RSI over `period` closes (needs at least `period + 1` closes).
+/// Returns a value in `[0, 100]`; `None` if there aren't enough closes.
+pub fn rsi(closes: &[f64], period: usize) -> Option<f64> {
+    if period == 0 || closes.len() <= period {
+        return None;
+    }
+    // Per-step gains/losses.
+    let deltas: Vec<f64> = closes.windows(2).map(|w| w[1] - w[0]).collect();
+    // Wilder seed: simple average of the first `period` gains/losses.
+    let seed = &deltas[..period];
+    let mut avg_gain = seed.iter().map(|d| d.max(0.0)).sum::<f64>() / period as f64;
+    let mut avg_loss = seed.iter().map(|d| (-d).max(0.0)).sum::<f64>() / period as f64;
+    // Wilder smoothing across the remaining deltas.
+    for &d in &deltas[period..] {
+        let gain = d.max(0.0);
+        let loss = (-d).max(0.0);
+        avg_gain = (avg_gain * (period as f64 - 1.0) + gain) / period as f64;
+        avg_loss = (avg_loss * (period as f64 - 1.0) + loss) / period as f64;
+    }
+    if avg_loss == 0.0 {
+        return Some(100.0);
+    }
+    let rs = avg_gain / avg_loss;
+    Some(100.0 - 100.0 / (1.0 + rs))
+}
+
+/// N-bar rate of change of a close series: `last / close[n-back] - 1`.
+/// `None` if there aren't `n + 1` closes or the reference close is zero.
+pub fn roc(closes: &[f64], n: usize) -> Option<f64> {
+    if n == 0 || closes.len() <= n {
+        return None;
+    }
+    let last = *closes.last().unwrap();
+    let prev = closes[closes.len() - 1 - n];
+    if prev == 0.0 {
+        return None;
+    }
+    Some(last / prev - 1.0)
+}
+
+/// On-balance volume series (cumulative), one point per bar. The first point is
+/// seeded at zero; each subsequent step adds/subtracts the bar's volume by the
+/// sign of the close-to-close change.
+pub fn obv(bars: &[Bar]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(bars.len());
+    let mut acc = 0.0;
+    for (i, b) in bars.iter().enumerate() {
+        if i > 0 {
+            let prev = bars[i - 1].close;
+            if b.close > prev {
+                acc += b.volume;
+            } else if b.close < prev {
+                acc -= b.volume;
+            }
+        }
+        out.push(acc);
+    }
+    out
+}
+
+/// Sign of the least-squares slope of a series against its index: `+1` rising,
+/// `-1` falling, `0` flat/insufficient data.
+pub fn slope_sign(ys: &[f64]) -> f64 {
+    let n = ys.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let mean_x = (nf - 1.0) / 2.0;
+    let mean_y = ys.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    for (i, &y) in ys.iter().enumerate() {
+        num += (i as f64 - mean_x) * (y - mean_y);
+    }
+    if num > 0.0 {
+        1.0
+    } else if num < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// Average daily dollar volume (close * volume) over the last `lookback` bars.
 pub fn dollar_adv(bars: &[Bar], lookback: usize) -> f64 {
     if bars.is_empty() {
@@ -243,6 +326,89 @@ mod tests {
             adx_chop < adx_up,
             "chop ADX ({adx_chop}) must be below trend ADX ({adx_up})"
         );
+    }
+
+    #[test]
+    fn rsi_bounds_and_extremes() {
+        // Strictly rising closes -> RSI saturates at 100 (no losses).
+        let up: Vec<f64> = (0..30).map(|i| 100.0 + i as f64).collect();
+        let r = rsi(&up, 14).unwrap();
+        assert!((r - 100.0).abs() < 1e-9, "monotone up -> RSI 100, got {r}");
+        // Strictly falling closes -> RSI floors near 0.
+        let down: Vec<f64> = (0..30).map(|i| 100.0 - i as f64).collect();
+        let rd = rsi(&down, 14).unwrap();
+        assert!(rd < 1.0, "monotone down -> RSI ~0, got {rd}");
+        // Always bounded.
+        let mixed = [100.0, 101.0, 100.5, 102.0, 101.0, 103.0, 102.5, 104.0];
+        if let Some(rm) = rsi(&mixed, 3) {
+            assert!((0.0..=100.0).contains(&rm));
+        }
+        assert_eq!(rsi(&[1.0, 2.0], 14), None);
+    }
+
+    #[test]
+    fn roc_sign_and_value() {
+        let closes = [100.0, 101.0, 99.0, 110.0];
+        // 3-back ROC: 110/100 - 1 = 0.10.
+        assert!((roc(&closes, 3).unwrap() - 0.10).abs() < 1e-9);
+        // 1-back ROC: 110/99 - 1 > 0.
+        assert!(roc(&closes, 1).unwrap() > 0.0);
+        assert_eq!(roc(&closes, 4), None);
+    }
+
+    #[test]
+    fn obv_accumulates_by_direction() {
+        let bars = vec![
+            // close 100 (seed 0), up to 101 (+vol), down to 100 (-vol), up to 102 (+vol)
+            Bar {
+                volume: 10.0,
+                ..bar(0.0, 0.0, 0.0, 100.0)
+            },
+            Bar {
+                volume: 5.0,
+                ..bar(0.0, 0.0, 0.0, 101.0)
+            },
+            Bar {
+                volume: 7.0,
+                ..bar(0.0, 0.0, 0.0, 100.0)
+            },
+            Bar {
+                volume: 3.0,
+                ..bar(0.0, 0.0, 0.0, 102.0)
+            },
+        ];
+        let o = obv(&bars);
+        assert_eq!(o, vec![0.0, 5.0, -2.0, 1.0]);
+
+        // A clean accumulation sequence (every up bar, growing volume) -> a
+        // monotonically rising OBV -> positive slope sign.
+        let accum = vec![
+            Bar {
+                volume: 1.0,
+                ..bar(0.0, 0.0, 0.0, 100.0)
+            },
+            Bar {
+                volume: 2.0,
+                ..bar(0.0, 0.0, 0.0, 101.0)
+            },
+            Bar {
+                volume: 3.0,
+                ..bar(0.0, 0.0, 0.0, 102.0)
+            },
+            Bar {
+                volume: 4.0,
+                ..bar(0.0, 0.0, 0.0, 103.0)
+            },
+        ];
+        assert_eq!(slope_sign(&obv(&accum)), 1.0);
+    }
+
+    #[test]
+    fn slope_sign_basic() {
+        assert_eq!(slope_sign(&[1.0, 2.0, 3.0]), 1.0);
+        assert_eq!(slope_sign(&[3.0, 2.0, 1.0]), -1.0);
+        assert_eq!(slope_sign(&[2.0, 2.0, 2.0]), 0.0);
+        assert_eq!(slope_sign(&[5.0]), 0.0);
     }
 
     #[test]
