@@ -9,7 +9,7 @@
 //! (for the OOS score). Skips cleanly when either is absent — absence never fails CI.
 
 use chrono::{TimeZone, Utc};
-use se_core::{Horizon, HorizonProfile, Ticker};
+use se_core::{HorizonProfile, Ticker};
 use se_mlclient::MlClient;
 use se_search::{
     backtest, build_window, score_oos, seed_population, FeatureCatalog, Rng, ScoreConfig,
@@ -27,9 +27,10 @@ async fn store_if_up() -> Option<Store> {
 async fn harness_if_up() -> Option<ValidationHarness> {
     let client = MlClient::from_env().ok()?;
     match client.health().await {
-        Ok(h) if h.status == "ok" => {
-            Some(ValidationHarness::new(client, std::env::temp_dir().join("se_search_p8")))
-        }
+        Ok(h) if h.status == "ok" => Some(ValidationHarness::new(
+            client,
+            std::env::temp_dir().join("se_search_p8"),
+        )),
         _ => None,
     }
 }
@@ -48,7 +49,9 @@ async fn run_under_profile(
     // SPY/QQQ carry the deepest history; build their windows.
     let mut windows = Vec::new();
     for t in [Ticker::Spy, Ticker::Qqq] {
-        let w = build_window(store, t, from, to, profile).await.expect("window");
+        let w = build_window(store, t, from, to, profile)
+            .await
+            .expect("window");
         if !w.points.is_empty() {
             windows.push(w);
         }
