@@ -27,3 +27,25 @@ jobs:
         run: pnpm --filter @swing-x/web test
       - name: Build
         run: pnpm --filter @swing-x/web build
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - name: Install
+        run: pnpm install --no-frozen-lockfile
+      # GitHub runners have no /opt/pw-browsers, so install Playwright's managed Chromium; the
+      # config (playwright.config.ts) falls back to it when the preinstalled path is absent.
+      - name: Install Playwright Chromium
+        working-directory: apps/web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: E2E smoke (build + preview + Playwright)
+        working-directory: apps/web
+        run: pnpm exec playwright test

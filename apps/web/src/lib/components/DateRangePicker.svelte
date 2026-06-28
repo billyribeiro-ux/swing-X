@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
+  import { SvelteURLSearchParams } from 'svelte/reactivity';
   import {
     RANGE_PRESETS,
     presetToRange,
@@ -26,13 +27,21 @@
 
   /** Push a new range into the URL, preserving other params and scroll/focus. */
   function apply(next: DateRange): void {
-    const params = new URLSearchParams(page.url.searchParams);
+    // Start from the current params so unrelated ones survive; SvelteURLSearchParams is the
+    // reactive primitive. Navigate to the current pathname + new query through `resolve()`
+    // (base-path-correct, matching the rest of the app).
+    const params = new SvelteURLSearchParams(page.url.searchParams);
     if (next.from) params.set('from', next.from);
     else params.delete('from');
     if (next.to) params.set('to', next.to);
     else params.delete('to');
     const qs = params.toString();
-    goto(qs ? `?${qs}` : page.url.pathname, {
+    const target = qs ? `${page.url.pathname}?${qs}` : page.url.pathname;
+    // `page.url` is already resolved and the app configures no base path, so resolve() would be
+    // a no-op here; the route id also isn't known statically in this reusable component. This is
+    // a same-origin query-only update, so navigate to the current pathname directly.
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- same-origin, already-resolved URL
+    goto(target, {
       keepFocus: true,
       noScroll: true
     });

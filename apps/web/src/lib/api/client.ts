@@ -111,7 +111,14 @@ async function resolve<T extends object>(
 // ---------------------------------------------------------------------------
 
 export function getSignals(fetchFn?: typeof fetch, range?: DateRange): Promise<Signal[]> {
-  return resolve('/api/signals', signalsSchema, signalFixtures, fetchFn, range, (s) => s.decisionTs);
+  return resolve(
+    '/api/signals',
+    signalsSchema,
+    signalFixtures,
+    fetchFn,
+    range,
+    (s) => s.decisionTs
+  );
 }
 
 export async function getSignal(id: string, fetchFn?: typeof fetch): Promise<Signal | null> {
@@ -147,7 +154,10 @@ export function getPopulation(fetchFn?: typeof fetch, range?: DateRange): Promis
   );
 }
 
-export function getMonitorEvents(fetchFn?: typeof fetch, range?: DateRange): Promise<MonitorEvent[]> {
+export function getMonitorEvents(
+  fetchFn?: typeof fetch,
+  range?: DateRange
+): Promise<MonitorEvent[]> {
   return resolve('/api/monitor', monitorEventsSchema, monitorFixtures, fetchFn, range, (e) => e.ts);
 }
 

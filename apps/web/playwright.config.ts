@@ -1,15 +1,19 @@
+import { existsSync } from 'node:fs';
 import { defineConfig, devices } from '@playwright/test';
 
 /**
  * E2E smoke config. Builds and previews the production app, then drives Chromium.
  *
- * Chromium is preinstalled at /opt/pw-browsers — we never run `playwright install`.
- * The bundled revision can lag this Playwright's expected build, so we point
- * `executablePath` at the full Chromium binary that is actually present. Override
- * with PW_CHROMIUM_PATH if your image places it elsewhere.
+ * Browser resolution, in order:
+ *   1. PW_CHROMIUM_PATH if set (explicit override).
+ *   2. This image's preinstalled Chromium at /opt/pw-browsers, if present (we never run
+ *      `playwright install` here — the bundled revision can lag Playwright's expected build).
+ *   3. Otherwise `undefined` -> Playwright's own managed browser. This is the GitHub-CI path,
+ *      where /opt/pw-browsers does not exist and the e2e job runs `playwright install chromium`.
  */
+const PREINSTALLED = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
 const chromiumPath =
-  process.env.PW_CHROMIUM_PATH ?? '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+  process.env.PW_CHROMIUM_PATH ?? (existsSync(PREINSTALLED) ? PREINSTALLED : undefined);
 
 export default defineConfig({
   testDir: 'e2e',
@@ -32,7 +36,7 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
-        launchOptions: { executablePath: chromiumPath }
+        launchOptions: chromiumPath ? { executablePath: chromiumPath } : {}
       }
     }
   ]

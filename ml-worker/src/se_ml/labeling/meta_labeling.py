@@ -8,6 +8,11 @@ A secondary classifier is trained to predict that meta-label from features. At i
 its probability is used both to GATE (act only when ``p >= threshold``) and to SIZE the
 position (e.g. proportional to ``p``). This decouples "which way" from "how much / whether"
 and is a standard way to lift precision without touching the primary's recall.
+
+Status: STAGED. These pure functions are verified by ``tests/test_meta_labeling.py`` and are
+ready to wire into the validation pipeline (a secondary classifier feeding ``decide`` before the
+gate computes cost-aware OOS expectancy on the sized returns). They are deliberately not yet on
+the live path so the promotion gate keeps measuring the primary edge in isolation.
 """
 
 from __future__ import annotations

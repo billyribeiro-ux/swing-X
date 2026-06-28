@@ -30,9 +30,7 @@ export function toDateParam(d: Date): string {
 export function presetToRange(preset: RangePreset, now: Date = new Date()): DateRange {
   if (preset === 'All') return {};
   const to = toDateParam(now);
-  const start = new Date(
-    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
-  );
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   switch (preset) {
     case '1M':
       start.setUTCMonth(start.getUTCMonth() - 1);
