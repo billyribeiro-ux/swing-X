@@ -119,23 +119,30 @@ def _regime_contrib(df: pd.DataFrame, oos_returns: np.ndarray) -> tuple[dict[str
     return contrib, int(sum(v > 0 for v in contrib.values()))
 
 
-def _trial_param_grid(n_trials: int) -> list[dict[str, object]]:
-    """Generate ``n_trials`` distinct LightGBM hyperparameter configs (the search space).
+def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str, object]]:
+    """Generate ``n_trials`` candidate configs spanning the realistic search space.
 
-    Each config is a candidate "strategy"; PBO measures whether selecting the in-sample
-    best among them generalises out of sample. The grid is deterministic given n_trials.
+    Each config varies BOTH LightGBM hyperparameters AND a random feature subset. The
+    feature-subset variation is what makes PBO meaningful: on a dataset with a genuine
+    edge, subsets that contain the signal consistently beat noise-only subsets (the IS-best
+    keeps winning OOS -> low PBO); on pure noise every subset is equivalent, so the IS-best
+    is OOS-random (-> high PBO). The grid is deterministic given ``seed``.
     """
-    leaves = [7, 15, 31, 63, 127]
-    lrs = [0.02, 0.05, 0.1, 0.2]
-    depths = [-1, 3, 5, 8]
+    rng = np.random.default_rng(seed)
+    leaves = [15, 31, 63]
+    lrs = [0.03, 0.05, 0.1]
     grid: list[dict[str, object]] = []
+    n = max(len(features), 1)
     for i in range(max(2, n_trials)):
+        # Random non-empty feature subset (at least half the features, to keep models sane).
+        k = rng.integers(max(1, n // 2), n + 1)
+        subset = sorted(rng.choice(features, size=int(k), replace=False).tolist())
         grid.append(
             {
                 "num_leaves": leaves[i % len(leaves)],
                 "learning_rate": lrs[(i // len(leaves)) % len(lrs)],
-                "max_depth": depths[(i // (len(leaves) * len(lrs))) % len(depths)],
                 "n_estimators": 120,
+                "_features": subset,  # consumed by _oos_returns_for_trial, not by LightGBM
             }
         )
     return grid
@@ -152,13 +159,19 @@ def _oos_returns_for_trial(
 
     A row is an "acted" trade when the purged-trained model is confident (proba >= 0.5);
     its return is the realized R label, else 0. Rows never appearing in a test fold stay 0.
+    The trial's feature subset (``params['_features']``) restricts the model's inputs.
     """
+    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
+    features = params.get("_features")
+    Xf = X[features] if isinstance(features, list) else X
     out = np.zeros(len(X), dtype=np.float64)
     for sp in splits:
         if sp.train_idx.size == 0 or sp.test_idx.size == 0:
             continue
-        model = fit_gbm(X.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=params)
-        proba = model.predict_proba(X.iloc[sp.test_idx])
+        model = fit_gbm(
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params
+        )
+        proba = model.predict_proba(Xf.iloc[sp.test_idx])
         out[sp.test_idx] = np.where(proba >= 0.5, y_np[sp.test_idx], 0.0)
     return out
 
@@ -196,7 +209,7 @@ def validate(req: ValidateRequest) -> ValidateResult:
         purge=fs.purge,
     )
 
-    grid = _trial_param_grid(req.n_trials)
+    grid = _trial_grid(req.n_trials, list(X.columns), seed=CONFIG.seed)
     # (T x n_trials) OOS performance matrix; one column per candidate config.
     trial_returns = np.column_stack(
         [_oos_returns_for_trial(X, y_np, splits, p, seed=1000 + i) for i, p in enumerate(grid)]

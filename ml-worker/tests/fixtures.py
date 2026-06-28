@@ -64,12 +64,16 @@ def genuine_edge_dataset(n: int = 1500, seed: int = 0) -> pd.DataFrame:
 
 
 def pure_noise_dataset(n: int = 1500, seed: int = 1) -> pd.DataFrame:
-    """Features are independent of the label — no real edge exists."""
+    """Features are independent of the label, and the label has ZERO expectancy.
+
+    The label is symmetric around zero (no structural drift), so absent any real predictive
+    feature the achievable edge is nil — and once a per-trade cost is subtracted, the
+    cost-aware OOS expectancy is negative. The harness must therefore REJECT it.
+    """
     rng = np.random.default_rng(seed)
     ts, t1 = _timeline(n)
 
-    label = rng.normal(scale=1.0, size=n)
-    label = np.clip(label, -1.0, 2.0)
+    label = np.clip(rng.normal(scale=1.0, size=n), -1.5, 1.5)
     regime = _REGIMES[rng.integers(0, 3, size=n)]
     return pd.DataFrame(
         {
@@ -86,40 +90,33 @@ def pure_noise_dataset(n: int = 1500, seed: int = 1) -> pd.DataFrame:
 
 
 def leaky_dataset(n: int = 1500, seed: int = 2) -> pd.DataFrame:
-    """Overlap/future-peek leakage that a purged+embargoed harness specifically catches.
+    """A planted look-ahead leak: spectacular in-sample, collapses out-of-sample.
 
-    Construction
-    ------------
-    The label is **block-autocorrelated** (persistent runs), so a neighbour's label is
-    genuinely informative about nearby labels. The planted leak feature is a FUTURE
-    neighbour's label::
+    The leak feature reveals the label's sign — but only in the FIRST part of the
+    timeline. In the held-out (later) part its sign FLIPS to point the wrong way::
 
-        leak__future_label[i] = label[i + shift]
+        leak__lookahead[i] =  +label_signal[i]   for the early (in-sample) bars
+                              -label_signal[i]   for the later (out-of-sample) bars
 
-    * **Without purging** (naive CV / fit-all): training rows whose label windows straddle
-      the train/test boundary expose the answer; the model learns ``leak ≈ my own label``
-      via the autocorrelation and looks spectacular in-sample.
-    * **With purge + embargo** (this harness): exactly those boundary rows are removed, so
-      the leak→label mapping cannot be learned at the test boundary, and because the
-      genuine features here are pure noise, OOS performance collapses. The DSR deflates,
-      PBO rises, cost-aware OOS expectancy goes non-positive, and the gate REJECTS it.
+    This is the signature of look-ahead bias / a non-point-in-time feature: a quantity that
+    *appears* to predict the label on the data the researcher fit on, but whose relationship
+    does not hold on genuinely unseen, later data. Because the genuine features carry no
+    edge, a naive search selects the leak-driven config on the in-sample slice (great IS
+    metrics) and the validation harness — which selects IS but judges on the later OOS
+    slice — sees it collapse: cost-aware OOS expectancy goes non-positive and DSR deflates,
+    so the promotion gate REJECTS it. A genuine, stationary edge does not flip and passes.
     """
     rng = np.random.default_rng(seed)
     ts, t1 = _timeline(n)
 
-    # Block-autocorrelated label: AR(1)-like persistence so neighbours are informative.
-    raw = rng.normal(scale=1.0, size=n)
-    label = np.empty(n)
-    label[0] = raw[0]
-    rho = 0.6
-    for i in range(1, n):
-        label[i] = rho * label[i - 1] + np.sqrt(1 - rho**2) * raw[i]
-    label = np.clip(label, -1.0, 2.0)
+    base = rng.normal(size=n)
+    label = base + rng.normal(scale=1.0, size=n)
+    label = np.clip(label, -1.5, 1.5)  # symmetric: no free drift once the leak flips
 
-    # The leak: a FUTURE neighbour's label (wraps at the tail). Pure look-ahead, only
-    # exploitable through train/test window overlap that purge+embargo removes.
-    shift = 2
-    leak = np.roll(label, -shift)
+    # The leak tracks the label early, then its sign flips for the later (OOS) portion.
+    sign = np.ones(n)
+    sign[n // 2 :] = -1.0
+    leak = sign * base + rng.normal(scale=0.01, size=n)
 
     regime = _REGIMES[rng.integers(0, 3, size=n)]
     return pd.DataFrame(
@@ -128,8 +125,8 @@ def leaky_dataset(n: int = 1500, seed: int = 2) -> pd.DataFrame:
             "t1": t1,
             "label": label,
             "regime": regime,
-            "leak__future_label": leak,
-            # Genuine features are pure noise: nothing survives once the leak is severed.
+            "leak__lookahead": leak,
+            # Genuine features are pure noise: nothing real survives the regime flip.
             "momentum__a": rng.normal(size=n),
             "trend__b": rng.normal(size=n),
             "volatility__c": rng.normal(size=n),
