@@ -12,12 +12,15 @@
 use std::collections::BTreeMap;
 
 use futures::StreamExt;
-use se_core::{Genome, HorizonProfile, Result, Strategy, StrategyId, StrategyStatus, Ticker};
+use se_core::{
+    Genome, HorizonProfile, RiskModel, Result, Strategy, StrategyId, StrategyStatus, Ticker,
+};
 use se_store::Store;
 use se_validation::ValidationHarness;
 
 use crate::backtest::{assemble, backtest};
 use crate::feature_matrix::{build_window, FeatureWindow};
+use crate::risk_search::RiskSpace;
 use crate::rng::Rng;
 use crate::score::{score_oos, OosScore, ScoreConfig, MIN_ENTRIES_TO_VALIDATE};
 use crate::seed::{seed_population, FeatureCatalog};

@@ -21,15 +21,67 @@ pub mod stream;
 use std::time::Duration;
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use serde::Deserialize;
 use se_store::Store;
 use tower_http::cors::CorsLayer;
 
+use crate::queries::DateBounds;
 pub use stream::{StreamHub, STREAM_POLL};
+
+/// Optional `?from=&to=` date-window query, shared by the list endpoints
+/// (`/api/signals`, `/api/population`, `/api/journal`, `/api/monitor`).
+///
+/// Each bound accepts either an ISO calendar date (`YYYY-MM-DD`) or a full
+/// RFC-3339 timestamp. Bounds are **inclusive**: a date-only `from` expands to
+/// `00:00:00Z` of that day and a date-only `to` expands to `23:59:59.999999999Z`
+/// of that day so the whole day is covered. When a param is absent or empty that
+/// side is unconstrained; when both are absent the endpoint is unfiltered, so
+/// existing callers see no behavior change. An unparseable value is ignored
+/// (treated as absent) rather than erroring, keeping the dashboard resilient.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DateRange {
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+impl DateRange {
+    /// Resolve the string params into concrete UTC bounds for the query layer.
+    pub fn bounds(&self) -> DateBounds {
+        DateBounds {
+            from: self.from.as_deref().and_then(|s| parse_bound(s, false)),
+            to: self.to.as_deref().and_then(|s| parse_bound(s, true)),
+        }
+    }
+}
+
+/// Parse one bound. Tries RFC-3339 first, then a bare `YYYY-MM-DD` date which is
+/// expanded to the start of the day (`from`) or the inclusive end of the day
+/// (`to`). Blank or malformed input yields `None` (no constraint on that side).
+fn parse_bound(raw: &str, is_upper: bool) -> Option<DateTime<Utc>> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let date = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    let naive = if is_upper {
+        // Inclusive end of day, nanosecond precision (timestamps compare <=).
+        date.and_hms_nano_opt(23, 59, 59, 999_999_999)?
+    } else {
+        date.and_hms_opt(0, 0, 0)?
+    };
+    Some(Utc.from_utc_datetime(&naive))
+}
 
 /// Shared application state. Cheap to clone (the store wraps an `Arc` pool, the hub
 /// holds a `broadcast::Sender`).
@@ -87,8 +139,8 @@ async fn health(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-async fn get_signals(State(state): State<AppState>) -> Response {
-    match queries::signals(&state.store).await {
+async fn get_signals(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
+    match queries::signals(&state.store, range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -106,22 +158,22 @@ async fn get_signal(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn get_population(State(state): State<AppState>) -> Response {
-    match queries::population(&state.store).await {
+async fn get_population(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
+    match queries::population(&state.store, range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
 }
 
-async fn get_monitor(State(state): State<AppState>) -> Response {
-    match queries::monitor_events(&state.store).await {
+async fn get_monitor(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
+    match queries::monitor_events(&state.store, range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
 }
 
-async fn get_journal(State(state): State<AppState>) -> Response {
-    match queries::journal(&state.store).await {
+async fn get_journal(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
+    match queries::journal(&state.store, range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -147,4 +199,49 @@ pub fn spawn_stream_poller(state: &AppState) {
     tokio::spawn(async move {
         stream::poll_loop(store, hub, Duration::from_millis(STREAM_POLL)).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_iso_date_bounds_inclusively() {
+        let r = DateRange {
+            from: Some("2026-01-01".into()),
+            to: Some("2026-12-31".into()),
+        };
+        let b = r.bounds();
+        assert_eq!(b.from.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        // upper bound expands to the inclusive end of the day
+        let to = b.to.unwrap();
+        assert_eq!(to.date_naive().to_string(), "2026-12-31");
+        assert_eq!(to.format("%H:%M:%S").to_string(), "23:59:59");
+    }
+
+    #[test]
+    fn parses_rfc3339_bounds_verbatim() {
+        let r = DateRange {
+            from: Some("2026-06-01T12:30:00Z".into()),
+            to: None,
+        };
+        let b = r.bounds();
+        assert_eq!(b.from.unwrap().to_rfc3339(), "2026-06-01T12:30:00+00:00");
+        assert!(b.to.is_none());
+    }
+
+    #[test]
+    fn missing_or_blank_or_garbage_bounds_are_unconstrained() {
+        let r = DateRange {
+            from: Some("   ".into()),
+            to: Some("not-a-date".into()),
+        };
+        let b = r.bounds();
+        assert!(b.from.is_none());
+        assert!(b.to.is_none());
+        assert!(b.is_unbounded());
+
+        let empty = DateRange::default().bounds();
+        assert!(empty.is_unbounded());
+    }
 }

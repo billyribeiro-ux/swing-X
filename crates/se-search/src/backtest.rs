@@ -87,7 +87,7 @@ pub fn backtest(
             continue;
         }
 
-        match labeler.label_one(&window.bars, point.idx, side, atr) {
+        match labeler.label_one_with_risk(&window.bars, point.idx, side, atr, &genome.risk) {
             Ok(event) => {
                 let features = to_column_features(&point.features);
                 result.entries.push(LabeledEntry {

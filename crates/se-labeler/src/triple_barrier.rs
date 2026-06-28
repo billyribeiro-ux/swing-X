@@ -22,7 +22,7 @@
 //! time barrier it is the signed close-to-close move divided by the risk (one R in price).
 
 use chrono::{DateTime, Utc};
-use se_core::{Bar, HorizonProfile, Side};
+use se_core::{Bar, HorizonProfile, RiskModel, Side};
 
 /// Which barrier was touched first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,9 @@ pub enum LabelError {
     NonPositiveAtr,
     /// `stop_atr_mult <= 0` (it defines the R unit and must be positive).
     NonPositiveStop,
+    /// The risk model's resolved stop distance was not strictly positive (it defines the R
+    /// unit and must be positive — e.g. a `fixed:0` or `pct:0` stop).
+    NonPositiveRisk,
     /// `max_hold_bars < 1`.
     ZeroMaxHold,
 }
@@ -81,6 +84,9 @@ impl std::fmt::Display for LabelError {
             LabelError::NonPositiveAtr => write!(f, "ATR must be > 0 at entry"),
             LabelError::NonPositiveStop => {
                 write!(f, "stop_atr_mult must be > 0 (defines the R unit)")
+            }
+            LabelError::NonPositiveRisk => {
+                write!(f, "risk model stop distance must be > 0 (defines the R unit)")
             }
             LabelError::ZeroMaxHold => write!(f, "max_hold_bars must be >= 1"),
         }
@@ -140,8 +146,9 @@ impl TripleBarrier {
         None
     }
 
-    /// Label a single entry: bars (ascending by `ts`), the entry bar index, side, and the
-    /// per-entry ATR (the volatility unit that sizes the barriers).
+    /// Label a single entry using the profile's ATR-multiple geometry (the legacy path,
+    /// reimplemented in terms of [`RiskModel::from_profile`]). See [`Self::label_one_with_risk`]
+    /// for the configurable/learnable geometry.
     ///
     /// First touchable bar is the NEXT bar after entry — no look-ahead on the entry bar's
     /// own range (entry executes at the entry close).
@@ -152,20 +159,39 @@ impl TripleBarrier {
         side: Side,
         atr: f64,
     ) -> Result<LabelEvent, LabelError> {
-        let target_mult = self.profile.target_atr_mult;
-        let stop_mult = self.profile.stop_atr_mult;
+        // Preserve the original validation surface: a non-positive ATR stop mult is its own
+        // error (it defines the R unit), distinct from a generic non-positive risk distance.
+        if self.profile.stop_atr_mult <= 0.0 {
+            return Err(LabelError::NonPositiveStop);
+        }
+        let risk = RiskModel::from_profile(&self.profile);
+        self.label_one_with_risk(bars, entry_idx, side, atr, &risk)
+    }
+
+    /// Label a single entry against an explicit [`RiskModel`] — the configurable + learnable
+    /// geometry. The stop distance is one R; target1 is the profit barrier. Realized R is the
+    /// signed price move divided by the risk distance (so a target touch = `target1_dist / R`,
+    /// a stop touch = `-1` R, and the time barrier = `signed_close_move / R`). Conservative
+    /// intrabar ordering (both-in-one-bar => stop) is unchanged.
+    pub fn label_one_with_risk(
+        &self,
+        bars: &[Bar],
+        entry_idx: usize,
+        side: Side,
+        atr: f64,
+        risk: &RiskModel,
+    ) -> Result<LabelEvent, LabelError> {
         let max_hold = self.profile.max_hold_bars as usize;
 
         if max_hold < 1 {
             return Err(LabelError::ZeroMaxHold);
         }
-        if stop_mult <= 0.0 {
-            return Err(LabelError::NonPositiveStop);
-        }
         if entry_idx >= bars.len() {
             return Err(LabelError::EntryOutOfRange(entry_idx));
         }
-        // Reject non-positive and NaN ATR (the latter would silently break the barriers).
+        // Reject non-positive and NaN ATR (the latter would silently break the barriers). ATR
+        // is needed even for fixed/percent stops because it is the canonical volatility input;
+        // an entry with no usable ATR is unlabelable upstream anyway.
         if atr <= 0.0 || atr.is_nan() {
             return Err(LabelError::NonPositiveAtr);
         }
@@ -173,9 +199,16 @@ impl TripleBarrier {
         let s = side.sign();
         let entry = bars[entry_idx];
         let entry_px = entry.close;
-        let risk = stop_mult * atr; // one R, in price units
-        let target_px = entry_px + s * target_mult * atr;
-        let stop_px = entry_px - s * stop_mult * atr;
+
+        // Resolve the geometry from the risk model. The stop distance is one R.
+        let risk_dist = risk.risk_distance(entry_px, atr);
+        if !(risk_dist > 0.0) || !risk_dist.is_finite() {
+            return Err(LabelError::NonPositiveRisk);
+        }
+        let stop_px = risk.stop_price(entry_px, atr, side);
+        // Only target1 is the labeling profit barrier (target2 is for signal display).
+        let target1_dist = risk.target1.distance(entry_px, atr, risk_dist);
+        let target_px = entry_px + s * target1_dist;
 
         let n = bars.len();
         let last_idx = (entry_idx + max_hold).min(n - 1);
@@ -194,10 +227,11 @@ impl TripleBarrier {
             None => {
                 // Time barrier: exit at the close of the vertical-barrier bar.
                 let exit_px = bars[last_idx].close;
-                let ret_r = s * (exit_px - entry_px) / risk;
+                let ret_r = s * (exit_px - entry_px) / risk_dist;
                 (last_idx, Outcome::Time, ret_r)
             }
-            Some((j, Outcome::Target)) => (j, Outcome::Target, target_mult / stop_mult),
+            // A target touch realizes the target distance in R units.
+            Some((j, Outcome::Target)) => (j, Outcome::Target, target1_dist / risk_dist),
             Some((j, Outcome::Stop)) => (j, Outcome::Stop, -1.0),
             // `resolve_bar` never returns Time.
             Some((j, Outcome::Time)) => (j, Outcome::Time, 0.0),
@@ -215,7 +249,8 @@ impl TripleBarrier {
         })
     }
 
-    /// Label a batch of entries. `entries` pairs an entry bar index with its side and ATR.
+    /// Label a batch of entries with the profile's ATR-multiple geometry. `entries` pairs an
+    /// entry bar index with its side and ATR.
     pub fn label_events(
         &self,
         bars: &[Bar],
@@ -224,6 +259,20 @@ impl TripleBarrier {
         entries
             .iter()
             .map(|&(idx, side, atr)| self.label_one(bars, idx, side, atr))
+            .collect()
+    }
+
+    /// Label a batch of entries with an explicit [`RiskModel`]. `entries` pairs an entry bar
+    /// index with its side and ATR; the same risk geometry applies to all of them.
+    pub fn label_events_with_risk(
+        &self,
+        bars: &[Bar],
+        entries: &[(usize, Side, f64)],
+        risk: &RiskModel,
+    ) -> Result<Vec<LabelEvent>, LabelError> {
+        entries
+            .iter()
+            .map(|&(idx, side, atr)| self.label_one_with_risk(bars, idx, side, atr, risk))
             .collect()
     }
 }
@@ -390,5 +439,97 @@ mod tests {
         let ev = tb.label_one(&bars, 0, Side::Long, 1.0).unwrap();
         assert_eq!(ev.outcome, Outcome::Target);
         assert!((ev.ret_r - 2.0).abs() < 1e-9);
+    }
+
+    // ---- RiskModel-aware path -------------------------------------------------
+
+    use se_core::{RiskModel, StopSpec, TargetSpec};
+
+    #[test]
+    fn label_one_matches_from_profile_risk_model() {
+        // The legacy path must equal the explicit RiskModel::from_profile path bar-for-bar.
+        let bars = vec![
+            bar(0, 100.0, 100.0, 100.0, 100.0),
+            bar(1, 100.0, 102.5, 100.5, 101.0),
+        ];
+        let tb = TripleBarrier::new(profile());
+        let legacy = tb.label_one(&bars, 0, Side::Long, 1.0).unwrap();
+        let rm = RiskModel::from_profile(tb.profile());
+        let explicit = tb
+            .label_one_with_risk(&bars, 0, Side::Long, 1.0, &rm)
+            .unwrap();
+        assert_eq!(legacy.target_px, explicit.target_px);
+        assert_eq!(legacy.stop_px, explicit.stop_px);
+        assert_eq!(legacy.outcome, explicit.outcome);
+        assert!((legacy.ret_r - explicit.ret_r).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fixed_dollar_stop_defines_the_r_unit() {
+        // entry 100, fixed $2 stop, target1 2R => target at 104 ($4), stop at 98.
+        let rm = RiskModel::new(StopSpec::fixed(2.0), TargetSpec::r_multiple(2.0), None);
+        let bars = vec![
+            bar(0, 100.0, 100.0, 100.0, 100.0),
+            bar(1, 100.0, 104.5, 100.5, 104.0),
+        ];
+        let tb = TripleBarrier::new(profile());
+        let ev = tb
+            .label_one_with_risk(&bars, 0, Side::Long, 1.0, &rm)
+            .unwrap();
+        assert_eq!(ev.outcome, Outcome::Target);
+        assert!((ev.target_px - 104.0).abs() < 1e-9);
+        assert!((ev.stop_px - 98.0).abs() < 1e-9);
+        assert!((ev.ret_r - 2.0).abs() < 1e-9, "ret_r={}", ev.ret_r);
+    }
+
+    #[test]
+    fn tighter_stop_trades_winrate_for_rr() {
+        // A 0.5-ATR stop with a 2R target reaches the target on a smaller move than a 1-ATR
+        // stop would, and a stop touch is still exactly -1R (the R unit shrank with the stop).
+        let rm = RiskModel::new(StopSpec::atr(0.5), TargetSpec::r_multiple(2.0), None);
+        // atr=2 -> risk_dist=1.0, target1 = 2R = 2.0 => target at 102, stop at 99.
+        let bars = vec![
+            bar(0, 100.0, 100.0, 100.0, 100.0),
+            bar(1, 100.0, 98.9, 98.5, 98.7), // dips to 98.5 -> stop 99 hit
+        ];
+        let tb = TripleBarrier::new(profile());
+        let ev = tb
+            .label_one_with_risk(&bars, 0, Side::Long, 2.0, &rm)
+            .unwrap();
+        assert_eq!(ev.outcome, Outcome::Stop);
+        assert!((ev.stop_px - 99.0).abs() < 1e-9);
+        assert!((ev.ret_r + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percent_stop_resolves() {
+        // entry 200, 1% stop => $2 risk, target 2R => $4 above (204), stop 198.
+        let rm = RiskModel::new(StopSpec::percent(1.0), TargetSpec::r_multiple(2.0), None);
+        let bars = vec![
+            bar(0, 200.0, 200.0, 200.0, 200.0),
+            bar(1, 200.0, 204.5, 200.5, 204.0),
+        ];
+        let tb = TripleBarrier::new(profile());
+        let ev = tb
+            .label_one_with_risk(&bars, 0, Side::Long, 5.0, &rm)
+            .unwrap();
+        assert_eq!(ev.outcome, Outcome::Target);
+        assert!((ev.target_px - 204.0).abs() < 1e-9);
+        assert!((ev.stop_px - 198.0).abs() < 1e-9);
+        assert!((ev.ret_r - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_risk_distance_is_error() {
+        let rm = RiskModel::new(StopSpec::fixed(0.0), TargetSpec::r_multiple(2.0), None);
+        let bars = vec![
+            bar(0, 100.0, 100.0, 100.0, 100.0),
+            bar(1, 100.0, 101.0, 99.5, 100.0),
+        ];
+        let tb = TripleBarrier::new(profile());
+        assert_eq!(
+            tb.label_one_with_risk(&bars, 0, Side::Long, 1.0, &rm),
+            Err(LabelError::NonPositiveRisk)
+        );
     }
 }

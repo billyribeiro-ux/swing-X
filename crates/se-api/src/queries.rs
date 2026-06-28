@@ -22,6 +22,25 @@ fn iso(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339()
 }
 
+/// Inclusive decision-time window for filtering list endpoints. Both bounds are
+/// optional: when a bound is `None` the corresponding side is unconstrained, and
+/// when both are `None` no filtering is applied (default dashboard behavior).
+///
+/// Bounds are pre-parsed to `DateTime<Utc>` by [`crate::DateRange::bounds`]; the
+/// query helpers below splice `>= from` / `<= to` predicates onto a column.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DateBounds {
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+}
+
+impl DateBounds {
+    /// True when neither bound is set (so callers can skip the filter entirely).
+    pub fn is_unbounded(&self) -> bool {
+        self.from.is_none() && self.to.is_none()
+    }
+}
+
 /// Parse a jsonb `why`/`attribution` array into typed drivers. Tolerant: a missing
 /// or malformed array yields an empty vec rather than an error (the dashboard treats
 /// attribution as optional context, never a hard dependency).
@@ -67,17 +86,47 @@ fn detail_to_string(v: &serde_json::Value) -> String {
 // Signals
 // ---------------------------------------------------------------------------
 
-pub async fn signals(store: &Store) -> Result<Vec<SignalDto>> {
-    let rows = sqlx::query(
+pub async fn signals(store: &Store, range: DateBounds) -> Result<Vec<SignalDto>> {
+    // `decision_ts` is the signal's decision time — the window the operator filters on.
+    let sql = format!(
         "SELECT signal_id, strategy_id, ticker, side, decision_ts, horizon, entry, stop, \
                 target1, target2, rr1, rr2, conviction, cohort_n, regime_desc, why, \
                 invalidation, cohort_expectancy, cvar5, lead_time, payload_json \
-         FROM signals ORDER BY decision_ts DESC LIMIT 500",
-    )
-    .fetch_all(store.pool())
-    .await
-    .map_err(store_err)?;
+         FROM signals{} ORDER BY decision_ts DESC LIMIT 500",
+        where_clause("decision_ts", range)
+    );
+    let rows = bind_bounds(sqlx::query(&sql), range)
+        .fetch_all(store.pool())
+        .await
+        .map_err(store_err)?;
     Ok(rows.iter().map(signal_from_row).collect())
+}
+
+/// Build the optional `WHERE col >= $1 [AND] col <= $2` fragment for a date window.
+/// Positional params are bound in the same order by [`bind_bounds`]. Returns an
+/// empty string when the range is unbounded so existing queries are unchanged.
+fn where_clause(col: &str, range: DateBounds) -> String {
+    match (range.from.is_some(), range.to.is_some()) {
+        (false, false) => String::new(),
+        (true, false) => format!(" WHERE {col} >= $1"),
+        (false, true) => format!(" WHERE {col} <= $1"),
+        (true, true) => format!(" WHERE {col} >= $1 AND {col} <= $2"),
+    }
+}
+
+/// Bind the present bounds positionally to match [`where_clause`] ordering.
+fn bind_bounds<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    range: DateBounds,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let mut q = query;
+    if let Some(from) = range.from {
+        q = q.bind(from);
+    }
+    if let Some(to) = range.to {
+        q = q.bind(to);
+    }
+    q
 }
 
 pub async fn signal_by_id(store: &Store, id: &str) -> Result<Option<SignalDto>> {
@@ -149,8 +198,13 @@ fn parse_minutes(s: &str) -> Option<f64> {
 // Population (strategies + latest oos_score)
 // ---------------------------------------------------------------------------
 
-pub async fn population(store: &Store) -> Result<Vec<StrategyDto>> {
-    let rows = sqlx::query(
+pub async fn population(store: &Store, range: DateBounds) -> Result<Vec<StrategyDto>> {
+    // Window strategies by their freshness timestamp: the latest OOS score's
+    // `evaluated_at` when one exists, else the strategy's own `created_at`
+    // (`COALESCE(o.evaluated_at, s.created_at)`). This keeps freshly created but
+    // not-yet-scored strategies visible inside a recent window.
+    let filter_expr = "COALESCE(o.evaluated_at, s.created_at)";
+    let sql = format!(
         "SELECT s.strategy_id, s.horizon, s.status, s.generation, s.genome, \
                 o.dsr, o.pbo, o.oos_expectancy_cost_aware, o.profit_factor, o.cvar5, o.mar, \
                 o.n_regimes_positive, o.passed_gate, o.evaluated_at \
@@ -160,12 +214,14 @@ pub async fn population(store: &Store) -> Result<Vec<StrategyDto>> {
                     n_regimes_positive, passed_gate, evaluated_at \
              FROM oos_scores WHERE strategy_id = s.strategy_id \
              ORDER BY evaluated_at DESC LIMIT 1 \
-         ) o ON TRUE \
+         ) o ON TRUE{} \
          ORDER BY s.generation DESC, s.created_at DESC LIMIT 500",
-    )
-    .fetch_all(store.pool())
-    .await
-    .map_err(store_err)?;
+        where_clause(filter_expr, range)
+    );
+    let rows = bind_bounds(sqlx::query(&sql), range)
+        .fetch_all(store.pool())
+        .await
+        .map_err(store_err)?;
 
     Ok(rows
         .iter()
@@ -231,14 +287,16 @@ fn genome_summary(g: &serde_json::Value) -> String {
 // Monitor events
 // ---------------------------------------------------------------------------
 
-pub async fn monitor_events(store: &Store) -> Result<Vec<MonitorEventDto>> {
-    let rows = sqlx::query(
+pub async fn monitor_events(store: &Store, range: DateBounds) -> Result<Vec<MonitorEventDto>> {
+    let sql = format!(
         "SELECT ts, detector, ticker, strategy_id, metric_value, threshold, action_taken, detail \
-         FROM monitor_events ORDER BY ts DESC LIMIT 500",
-    )
-    .fetch_all(store.pool())
-    .await
-    .map_err(store_err)?;
+         FROM monitor_events{} ORDER BY ts DESC LIMIT 500",
+        where_clause("ts", range)
+    );
+    let rows = bind_bounds(sqlx::query(&sql), range)
+        .fetch_all(store.pool())
+        .await
+        .map_err(store_err)?;
     Ok(rows.iter().map(monitor_event_from_row).collect())
 }
 
@@ -264,15 +322,17 @@ fn monitor_event_from_row(row: &sqlx::postgres::PgRow) -> MonitorEventDto {
 // Journal
 // ---------------------------------------------------------------------------
 
-pub async fn journal(store: &Store) -> Result<Vec<TradeDto>> {
-    let rows = sqlx::query(
+pub async fn journal(store: &Store, range: DateBounds) -> Result<Vec<TradeDto>> {
+    let sql = format!(
         "SELECT trade_id, signal_id, strategy_id, ticker, side, mode, entry_ts, fill_px, fill_ts, \
                 exit_ts, exit_px, pnl_r, cost_frac, attribution \
-         FROM trades_journal ORDER BY entry_ts DESC LIMIT 500",
-    )
-    .fetch_all(store.pool())
-    .await
-    .map_err(store_err)?;
+         FROM trades_journal{} ORDER BY entry_ts DESC LIMIT 500",
+        where_clause("entry_ts", range)
+    );
+    let rows = bind_bounds(sqlx::query(&sql), range)
+        .fetch_all(store.pool())
+        .await
+        .map_err(store_err)?;
     Ok(rows.iter().map(trade_from_row).collect())
 }
 
@@ -396,6 +456,40 @@ mod tests {
         assert_eq!(parse_minutes("34"), Some(34.0));
         assert_eq!(parse_minutes("34m"), Some(34.0));
         assert_eq!(parse_minutes("eod"), None);
+    }
+
+    #[test]
+    fn where_clause_covers_bound_combinations() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(where_clause("decision_ts", DateBounds::default()), "");
+        assert!(DateBounds::default().is_unbounded());
+
+        let from_only = DateBounds {
+            from: Some(ts),
+            to: None,
+        };
+        assert_eq!(
+            where_clause("decision_ts", from_only),
+            " WHERE decision_ts >= $1"
+        );
+
+        let to_only = DateBounds {
+            from: None,
+            to: Some(ts),
+        };
+        assert_eq!(where_clause("ts", to_only), " WHERE ts <= $1");
+
+        let both = DateBounds {
+            from: Some(ts),
+            to: Some(ts),
+        };
+        assert_eq!(
+            where_clause("entry_ts", both),
+            " WHERE entry_ts >= $1 AND entry_ts <= $2"
+        );
+        assert!(!both.is_unbounded());
     }
 
     #[test]

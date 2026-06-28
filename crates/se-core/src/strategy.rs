@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::{Horizon, Layer, Side, StrategyId};
+use crate::{Horizon, Layer, RiskModel, Side, StrategyId};
 
 /// Comparison operator for a feature predicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +72,20 @@ pub struct Genome {
     pub side: Side,
     pub horizon: Horizon,
     pub predicates: Vec<Predicate>,
+    /// Stop/target geometry. The operator sets a starting model; the search evolves it (unless
+    /// locked) and the OOS scoreboard keeps the best risk geometry.
+    ///
+    /// Old genomes persisted before this field existed have no `risk` key in their jsonb, so we
+    /// supply a fixed sensible default ([`RiskModel::default_const`] — a 1-ATR stop with 2R/3R
+    /// targets) on deserialize. Serde defaults can't read sibling fields, so this is horizon
+    /// agnostic by necessity; freshly seeded genomes get a horizon-aware model from the search.
+    #[serde(default = "genome_default_risk")]
+    pub risk: RiskModel,
+}
+
+/// The serde default for [`Genome::risk`] when an old persisted genome lacks the field.
+fn genome_default_risk() -> RiskModel {
+    RiskModel::default_const()
 }
 
 impl Genome {
@@ -80,6 +94,23 @@ impl Genome {
             side,
             horizon,
             predicates,
+            risk: RiskModel::from_profile(&crate::HorizonProfile::for_horizon(horizon)),
+        }
+    }
+
+    /// Construct a genome with an explicit risk model (used by the search when seeding/mutating
+    /// risk geometry).
+    pub fn with_risk(
+        side: Side,
+        horizon: Horizon,
+        predicates: Vec<Predicate>,
+        risk: RiskModel,
+    ) -> Self {
+        Genome {
+            side,
+            horizon,
+            predicates,
+            risk,
         }
     }
 
@@ -109,7 +140,13 @@ impl Genome {
             .map(|p| p.describe())
             .collect::<Vec<_>>()
             .join(" AND ");
-        format!("{:?} {} :: {}", self.side, self.horizon.as_str(), conds)
+        format!(
+            "{:?} {} :: {} [{}]",
+            self.side,
+            self.horizon.as_str(),
+            conds,
+            self.risk.describe()
+        )
     }
 }
 
@@ -159,5 +196,69 @@ impl Strategy {
             generation: 0,
             parent: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HorizonProfile, RiskModel, StopSpec, TargetSpec};
+
+    fn pred() -> Predicate {
+        Predicate {
+            layer: Layer::Trigger,
+            feature_key: "trigger.rsi14".into(),
+            op: CmpOp::Gt,
+            threshold: 55.0,
+        }
+    }
+
+    #[test]
+    fn new_genome_gets_profile_risk() {
+        let g = Genome::new(Side::Long, Horizon::Swing, vec![pred()]);
+        assert_eq!(
+            g.risk,
+            RiskModel::from_profile(&HorizonProfile::for_horizon(Horizon::Swing))
+        );
+    }
+
+    #[test]
+    fn old_genome_without_risk_field_still_deserializes() {
+        // Exactly the jsonb shape persisted before the `risk` field existed.
+        let legacy = serde_json::json!({
+            "side": "Long",
+            "horizon": "swing",
+            "predicates": [
+                {"layer": "trigger", "feature_key": "trigger.rsi14", "op": "gt", "threshold": 55.0}
+            ]
+        });
+        let g: Genome = serde_json::from_value(legacy).expect("legacy genome must deserialize");
+        // Falls back to the fixed sensible default.
+        assert_eq!(g.risk, RiskModel::default_const());
+        assert_eq!(g.predicates.len(), 1);
+    }
+
+    #[test]
+    fn genome_round_trips_with_risk() {
+        let g = Genome::with_risk(
+            Side::Short,
+            Horizon::Day,
+            vec![pred()],
+            RiskModel::new(StopSpec::fixed(5.35), TargetSpec::r_multiple(2.0), None),
+        );
+        let json = serde_json::to_value(&g).unwrap();
+        let back: Genome = serde_json::from_value(json).unwrap();
+        assert_eq!(g, back);
+    }
+
+    #[test]
+    fn describe_includes_risk() {
+        let g = Genome::with_risk(
+            Side::Long,
+            Horizon::Swing,
+            vec![pred()],
+            RiskModel::new(StopSpec::atr(1.0), TargetSpec::r_multiple(2.0), None),
+        );
+        assert!(g.describe().contains("stop=1ATR"), "{}", g.describe());
     }
 }

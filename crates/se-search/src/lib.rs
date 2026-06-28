@@ -25,6 +25,7 @@ pub mod feature_matrix;
 pub mod genome_ops;
 pub mod persist;
 pub mod population;
+pub mod risk_search;
 pub mod rng;
 pub mod score;
 pub mod seed;
@@ -39,6 +40,7 @@ pub use persist::{
 pub use population::{
     Evaluated, EvolveOutcome, PopulationManager, SearchConfig, DEFAULT_SEARCH_SEED,
 };
+pub use risk_search::RiskSpace;
 pub use rng::Rng;
 pub use score::{score_oos, OosScore, ScoreConfig, MIN_ENTRIES_TO_VALIDATE};
 pub use seed::{layer_of_key, random_genome, seed_population, FeatureCatalog, FeatureStat};

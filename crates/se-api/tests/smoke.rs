@@ -43,6 +43,7 @@ async fn health_and_signals_smoke() {
 
     // /api/signals -> 200, JSON array (possibly empty)
     let res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/api/signals")
@@ -55,4 +56,24 @@ async fn health_and_signals_smoke() {
     let body = res.into_body().collect().await.unwrap().to_bytes();
     let v: serde_json::Value = serde_json::from_slice(&body).expect("signals is JSON");
     assert!(v.is_array(), "GET /api/signals must return a JSON array");
+
+    // /api/signals with a date window -> 200, JSON array. The window filters
+    // `decision_ts`; the result is a (possibly empty) array, never an error.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/signals?from=2026-01-01&to=2026-12-31")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value =
+        serde_json::from_slice(&body).expect("ranged signals is JSON");
+    assert!(
+        v.is_array(),
+        "GET /api/signals?from&to must return a JSON array"
+    );
 }
