@@ -24,6 +24,7 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgres://swing:swing@localhost:5433/swing
+      ML_WORKER_URL: http://127.0.0.1:8088
       RUST_BACKTRACE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +36,23 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Start the Python ML sidecar so the cross-language P4 leak checkpoint
+      # (crates/se-validation/tests/p4_checkpoint.rs) actually RUNS in CI instead of
+      # skipping — this is the 3rd level of the deliberate-leakage proof.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Start ml-worker
+        working-directory: ml-worker
+        run: |
+          uv sync --all-extras
+          uv run uvicorn se_ml.server:app --host 127.0.0.1 --port 8088 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8088/health >/dev/null; then echo "ml-worker up"; break; fi
+            sleep 2
+          done
+          curl -sf http://127.0.0.1:8088/health || { echo "ml-worker failed to start"; exit 1; }
       - name: Test
-        # FMP_API_KEY is absent in CI, so live-provider tests skip themselves.
+        # FMP_API_KEY is absent in CI, so live-provider tests skip themselves. The ml-worker is
+        # up (above), so the P4 cross-language leak checkpoint runs rather than skipping.
         run: cargo test --workspace

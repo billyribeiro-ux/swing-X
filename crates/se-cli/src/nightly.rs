@@ -49,23 +49,26 @@ pub struct NightlyArgs {
     pub lock_risk: bool,
 }
 
+/// Pick the data provider for the nightly run: an explicit `--provider` (lowercased) wins;
+/// otherwise default to `fmp` when a key is configured and `mock` when it isn't — so a keyless
+/// environment never tries to hit the live API.
+fn choose_provider(explicit: Option<&str>, fmp_configured: bool) -> String {
+    explicit.map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| {
+        if fmp_configured {
+            "fmp".into()
+        } else {
+            "mock".into()
+        }
+    })
+}
+
 pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
     let store = Store::connect(&cfg.database_url)
         .await
         .context("connect db")?;
     store.migrate().await.context("migrate")?;
 
-    let chosen = args
-        .provider
-        .clone()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_else(|| {
-            if cfg.fmp_configured {
-                "fmp".into()
-            } else {
-                "mock".into()
-            }
-        });
+    let chosen = choose_provider(args.provider.as_deref(), cfg.fmp_configured);
 
     let to = Utc::now().date_naive();
     let from = to - Duration::days(args.history_days.max(1));
@@ -151,4 +154,26 @@ pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
 
     println!("\n✓ nightly loop complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_provider;
+
+    #[test]
+    fn defaults_to_mock_without_fmp_key() {
+        // The critical branch: no key => never pick fmp (which would crash on a live call).
+        assert_eq!(choose_provider(None, false), "mock");
+    }
+
+    #[test]
+    fn defaults_to_fmp_when_configured() {
+        assert_eq!(choose_provider(None, true), "fmp");
+    }
+
+    #[test]
+    fn explicit_provider_overrides_and_lowercases() {
+        assert_eq!(choose_provider(Some("MOCK"), true), "mock");
+        assert_eq!(choose_provider(Some("Fmp"), false), "fmp");
+    }
 }

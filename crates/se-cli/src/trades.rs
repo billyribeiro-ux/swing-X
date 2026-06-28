@@ -33,6 +33,76 @@ fn side_str(side: Side) -> &'static str {
     }
 }
 
+/// Reconstruct the realized exit price for a resolved backtest entry. Target/stop exits use the
+/// stored barrier price; a time exit is reconstructed from realized R and the risk (stop) distance
+/// — `|entry − stop|` is exactly one R by construction, so this inverts
+/// `ret_r = side·(exit − entry) / R`.
+fn reconstruct_exit_px(
+    outcome: &str,
+    entry_px: f64,
+    stop_px: f64,
+    target_px: f64,
+    ret_r: f64,
+    side: Side,
+) -> f64 {
+    match outcome {
+        "target" => target_px,
+        "stop" => stop_px,
+        // time exit: reconstruct from realized R and the risk distance.
+        _ => entry_px + side.sign() * ret_r * (entry_px - stop_px).abs(),
+    }
+}
+
+/// Running winners/losers tally over per-trade R outcomes. A trade is a winner iff its realized R
+/// is strictly positive; everything else (including a breakeven time exit) is a loser — matching
+/// the journal's win/loss split. `win_rate` here is descriptive only; the engine never ranks on it.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct TradeStats {
+    total: usize,
+    wins: usize,
+    gross_win: f64,
+    gross_loss: f64,
+    sum_r: f64,
+}
+
+impl TradeStats {
+    fn push(&mut self, ret_r: f64) {
+        self.total += 1;
+        self.sum_r += ret_r;
+        if ret_r > 0.0 {
+            self.wins += 1;
+            self.gross_win += ret_r;
+        } else {
+            self.gross_loss += -ret_r;
+        }
+    }
+    fn losses(&self) -> usize {
+        self.total - self.wins
+    }
+    fn avg_r(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.sum_r / self.total as f64
+        }
+    }
+    fn win_rate(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.wins as f64 / self.total as f64 * 100.0
+        }
+    }
+    /// Gross wins ÷ gross losses; `+∞` when there are no losing R (an unbeaten record).
+    fn profit_factor(&self) -> f64 {
+        if self.gross_loss > 0.0 {
+            self.gross_win / self.gross_loss
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
 pub async fn run(
     cfg: &AppConfig,
     horizon: Option<String>,
@@ -77,11 +147,7 @@ pub async fn run(
         .context("clear prior backtest trades")?;
 
     let cost = profile.cost.round_trip_frac();
-    let mut total = 0usize;
-    let mut wins = 0usize;
-    let mut gross_win = 0.0f64;
-    let mut gross_loss = 0.0f64;
-    let mut sum_r = 0.0f64;
+    let mut stats = TradeStats::default();
     let mut sample: Vec<(String, &'static str, f64, f64, &'static str)> = Vec::new();
 
     for strat in &promoted {
@@ -94,21 +160,15 @@ pub async fn run(
             let res = backtest(&strat.genome, &window, &profile);
             for entry in &res.entries {
                 let ev = &entry.event;
-                let win = ev.ret_r > 0.0;
-                if win {
-                    wins += 1;
-                    gross_win += ev.ret_r;
-                } else {
-                    gross_loss += -ev.ret_r;
-                }
-                total += 1;
-                sum_r += ev.ret_r;
-                let exit_px = match ev.outcome.as_str() {
-                    "target" => ev.target_px,
-                    "stop" => ev.stop_px,
-                    // time exit: reconstruct from realized R and the risk distance.
-                    _ => ev.entry_px + side.sign() * ev.ret_r * (ev.entry_px - ev.stop_px).abs(),
-                };
+                stats.push(ev.ret_r);
+                let exit_px = reconstruct_exit_px(
+                    ev.outcome.as_str(),
+                    ev.entry_px,
+                    ev.stop_px,
+                    ev.target_px,
+                    ev.ret_r,
+                    side,
+                );
                 sqlx::query(
                     "INSERT INTO trades_journal \
                      (trade_id, strategy_id, ticker, side, mode, entry_ts, fill_px, fill_ts, \
@@ -145,19 +205,19 @@ pub async fn run(
         }
     }
 
-    if total == 0 {
+    if stats.total == 0 {
         println!("Promoted strategies fired no labelable entries in this window.");
         return Ok(());
     }
 
-    let losses = total - wins;
-    let win_rate = wins as f64 / total as f64 * 100.0;
-    let avg_r = sum_r / total as f64;
-    let pf = if gross_loss > 0.0 {
-        gross_win / gross_loss
-    } else {
-        f64::INFINITY
-    };
+    let total = stats.total;
+    let wins = stats.wins;
+    let losses = stats.losses();
+    let win_rate = stats.win_rate();
+    let avg_r = stats.avg_r();
+    let pf = stats.profit_factor();
+    let gross_win = stats.gross_win;
+    let gross_loss = stats.gross_loss;
 
     println!("\nSAMPLE TRADES (first {}):", sample.len());
     println!(
@@ -218,4 +278,86 @@ pub async fn run(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trade_stats_tallies_winners_losers_and_expectancy() {
+        let mut s = TradeStats::default();
+        for r in [2.0, 2.0, -1.0, 2.0, -1.0] {
+            s.push(r);
+        }
+        assert_eq!(s.total, 5);
+        assert_eq!(s.wins, 3);
+        assert_eq!(s.losses(), 2);
+        assert!((s.sum_r - 4.0).abs() < 1e-12);
+        assert!((s.avg_r() - 0.8).abs() < 1e-12);
+        assert!((s.win_rate() - 60.0).abs() < 1e-12);
+        // gross wins 6.0 / gross losses 2.0 = 3.0
+        assert!((s.profit_factor() - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn breakeven_time_exit_counts_as_loss_not_win() {
+        // ret_r == 0 is NOT a win (strictly-positive rule) and adds 0 to gross_loss magnitude.
+        let mut s = TradeStats::default();
+        s.push(0.0);
+        assert_eq!(s.wins, 0);
+        assert_eq!(s.losses(), 1);
+        assert_eq!(s.gross_loss, 0.0);
+    }
+
+    #[test]
+    fn empty_stats_are_zero_not_nan() {
+        let s = TradeStats::default();
+        assert_eq!(s.avg_r(), 0.0);
+        assert_eq!(s.win_rate(), 0.0);
+        // no losses -> profit factor is +inf, never NaN.
+        assert!(s.profit_factor().is_infinite());
+    }
+
+    #[test]
+    fn unbeaten_record_has_infinite_profit_factor() {
+        let mut s = TradeStats::default();
+        s.push(2.0);
+        s.push(1.5);
+        assert!(s.profit_factor().is_infinite());
+        assert_eq!(s.losses(), 0);
+    }
+
+    #[test]
+    fn reconstruct_exit_uses_stored_barrier_for_target_and_stop() {
+        // target/stop branches return the stored barrier price verbatim, regardless of ret_r.
+        assert_eq!(
+            reconstruct_exit_px("target", 100.0, 98.0, 104.0, 2.0, Side::Long),
+            104.0
+        );
+        assert_eq!(
+            reconstruct_exit_px("stop", 100.0, 98.0, 104.0, -1.0, Side::Long),
+            98.0
+        );
+    }
+
+    #[test]
+    fn reconstruct_time_exit_inverts_ret_r_exactly_long() {
+        // Long, entry 100, stop 98 => R = |100-98| = 2. A +0.5R time exit lands at 100 + 0.5*2 = 101.
+        let px = reconstruct_exit_px("time", 100.0, 98.0, 104.0, 0.5, Side::Long);
+        assert!((px - 101.0).abs() < 1e-9, "px={px}");
+        // Round-trip: recompute ret_r the labeler way and confirm it matches.
+        let r = (px - 100.0) / (100.0_f64 - 98.0).abs(); // long sign = +1
+        assert!((r - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reconstruct_time_exit_inverts_ret_r_exactly_short() {
+        // Short, entry 100, stop 102 => R = 2. A +0.5R (favorable) exit: 100 + (-1)*0.5*2 = 99.
+        let px = reconstruct_exit_px("time", 100.0, 102.0, 96.0, 0.5, Side::Short);
+        assert!((px - 99.0).abs() < 1e-9, "px={px}");
+        // Round-trip with short sign (-1): ret_r = -(px-entry)/R.
+        let r = -(px - 100.0) / (100.0_f64 - 102.0).abs();
+        assert!((r - 0.5).abs() < 1e-9);
+    }
 }
