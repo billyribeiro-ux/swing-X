@@ -38,9 +38,25 @@ pnpm db:up
 cargo build --workspace
 # sqlx migrate run   (or: cargo run -p se-cli -- migrate)
 
-# 4. Python ML worker
+# 4. Python ML worker (required for search/validation)
 cd ml-worker && uv sync && uv run uvicorn se_ml.server:app --port 8088
 ```
+
+## Operator commands (`cargo run -p se-cli --bin se -- <cmd>`)
+
+| Command | What it does |
+|---|---|
+| `migrate` | Apply database migrations. |
+| `scan [--provider fmp\|mock] [--from --to]` | Ingest a window + macro; run the Layer-0 tradeability gate (scores + rejects-with-reasons). |
+| `regime-sanity-check` | Label known windows and assert COVID/2022 → risk-off/vol-expansion, calm → risk-on/vol-compression. |
+| `search --generations N --per-gen M` | Evolve genomes; rank on the **OOS scoreboard only**; persist population + scores. |
+| `promote --dry-run` | Print the full promotion gate per condition (DSR>0, PBO<0.5, cost-aware OOS expectancy>0, ≥2 regimes). |
+| `signals [--journal]` | Surface executable signals (entry/stop/target/attribution) from promoted strategies; optionally paper-fill. |
+| `inject-leak-test` | The §8 leakage checkpoint: confirm a planted look-ahead feature is **rejected** and genuine edge passes. |
+| `nightly` | Run the whole walk-forward loop once: ingest → search → signals → journal → monitor → changelog. |
+
+The axum API (`cargo run -p se-api`) serves the dashboard at `SE_API_BIND` (default `:8080`); set
+`PUBLIC_API_BASE` in `apps/web` to point the dashboard at it (else it uses fixtures).
 
 ## Data providers
 
