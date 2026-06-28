@@ -40,7 +40,9 @@ pub async fn run(
     to: Option<String>,
 ) -> Result<()> {
     let profile: HorizonProfile = resolve_profile(cfg, horizon.as_deref())?;
-    let store = Store::connect(&cfg.database_url).await.context("connect db")?;
+    let store = Store::connect(&cfg.database_url)
+        .await
+        .context("connect db")?;
     store.migrate().await.context("migrate")?;
 
     let to_date = match to {
@@ -131,7 +133,13 @@ pub async fn run(
                 .await
                 .context("insert backtest trade")?;
                 if sample.len() < 16 {
-                    sample.push((ticker.to_string(), sstr, ev.entry_px, ev.ret_r, ev.outcome.as_str()));
+                    sample.push((
+                        ticker.to_string(),
+                        sstr,
+                        ev.entry_px,
+                        ev.ret_r,
+                        ev.outcome.as_str(),
+                    ));
                 }
             }
         }
@@ -152,7 +160,10 @@ pub async fn run(
     };
 
     println!("\nSAMPLE TRADES (first {}):", sample.len());
-    println!("{:<6} {:<6} {:>10} {:>9} {:>8}", "TICKER", "SIDE", "ENTRY", "PnL(R)", "OUTCOME");
+    println!(
+        "{:<6} {:<6} {:>10} {:>9} {:>8}",
+        "TICKER", "SIDE", "ENTRY", "PnL(R)", "OUTCOME"
+    );
     println!("{}", "-".repeat(46));
     for (t, s, entry, r, outcome) in &sample {
         let tag = if *r > 0.0 { "WIN " } else { "LOSS" };
@@ -164,7 +175,9 @@ pub async fn run(
     println!("  winners:     {wins}  ({win_rate:.1}%)");
     println!("  losers:      {losses}  ({:.1}%)", 100.0 - win_rate);
     println!("  avg trade:   {avg_r:+.3} R");
-    println!("  profit factor: {pf:.2}   (gross wins {gross_win:.1}R / gross losses {gross_loss:.1}R)");
+    println!(
+        "  profit factor: {pf:.2}   (gross wins {gross_win:.1}R / gross losses {gross_loss:.1}R)"
+    );
     println!("  expectancy:  {avg_r:+.3} R/trade");
 
     // Honesty: the record above is IN-SAMPLE (the raw backtest, memorization-prone).
@@ -190,7 +203,9 @@ pub async fn run(
         );
     }
     println!("→ journaled as mode=backtest; view on the dashboard Journal page.");
-    println!("(win rate is descriptive only — the engine ranks on expectancy/PF/CVaR, never win rate.)");
+    println!(
+        "(win rate is descriptive only — the engine ranks on expectancy/PF/CVaR, never win rate.)"
+    );
 
     Ok(())
 }

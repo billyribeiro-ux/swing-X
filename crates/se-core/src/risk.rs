@@ -60,14 +60,21 @@ impl StopSpec {
         d.abs()
     }
 
-    /// Short human form, e.g. `1.0ATR`, `$5.35`, `2.5%`.
+    /// Short human form, e.g. `1ATR`, `$5.35`, `2.5%`.
     pub fn describe(&self) -> String {
         match self {
-            StopSpec::Atr { mult } => format!("{mult}ATR"),
-            StopSpec::Fixed { dollars } => format!("${dollars}"),
-            StopSpec::Percent { pct } => format!("{pct}%"),
+            StopSpec::Atr { mult } => format!("{}ATR", fmt_num(*mult)),
+            StopSpec::Fixed { dollars } => format!("${}", fmt_num(*dollars)),
+            StopSpec::Percent { pct } => format!("{}%", fmt_num(*pct)),
         }
     }
+}
+
+/// Format a magnitude for human display: up to 2 decimals, trailing zeros trimmed.
+fn fmt_num(v: f64) -> String {
+    let s = format!("{v:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    s.to_string()
 }
 
 impl FromStr for StopSpec {
@@ -135,13 +142,13 @@ impl TargetSpec {
         d.abs()
     }
 
-    /// Short human form, e.g. `2.0R`, `2.0ATR`, `$10.00`, `3.0%`.
+    /// Short human form, e.g. `2R`, `2ATR`, `$10`, `3%`.
     pub fn describe(&self) -> String {
         match self {
-            TargetSpec::Atr { mult } => format!("{mult}ATR"),
-            TargetSpec::Fixed { dollars } => format!("${dollars}"),
-            TargetSpec::Percent { pct } => format!("{pct}%"),
-            TargetSpec::RMultiple { r } => format!("{r}R"),
+            TargetSpec::Atr { mult } => format!("{}ATR", fmt_num(*mult)),
+            TargetSpec::Fixed { dollars } => format!("${}", fmt_num(*dollars)),
+            TargetSpec::Percent { pct } => format!("{}%", fmt_num(*pct)),
+            TargetSpec::RMultiple { r } => format!("{}R", fmt_num(*r)),
         }
     }
 }
