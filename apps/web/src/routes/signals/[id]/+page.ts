@@ -3,8 +3,8 @@ import { getSignal } from '$lib/api/client';
 import { buildCandles, buildVwap } from '$lib/fixtures/candles';
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ params }) => {
-  const signal = await getSignal(params.id);
+export const load: PageLoad = async ({ params, fetch }) => {
+  const signal = await getSignal(params.id, fetch);
   if (!signal) {
     error(404, `Signal ${params.id} not found`);
   }

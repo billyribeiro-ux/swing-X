@@ -6,5 +6,27 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "se-api"
+path = "src/main.rs"
+
 [dependencies]
 se-core = { path = "../se-core" }
+se-store = { path = "../se-store" }
+se-monitor = { path = "../se-monitor" }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
