@@ -8,10 +8,39 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 
 use se_config::AppConfig;
-use se_core::{Horizon, HorizonProfile};
+use se_core::{Horizon, HorizonProfile, RiskModel};
 use se_search::{PopulationManager, ScoreConfig, SearchConfig};
 use se_store::Store;
 use se_validation::ValidationHarness;
+
+/// Operator overrides for the ground-rule risk geometry, parsed from the CLI flags. `None`
+/// fields fall back to the config / horizon default.
+#[derive(Debug, Clone, Default)]
+pub struct RiskArgs {
+    pub stop: Option<String>,
+    pub target1: Option<String>,
+    pub target2: Option<String>,
+    pub lock_risk: bool,
+}
+
+/// Resolve the operator's ground-rule [`RiskModel`] from the config default + CLI overrides.
+fn resolve_risk(cfg: &AppConfig, args: &RiskArgs) -> Result<RiskModel> {
+    let base = cfg.risk;
+    let stop = match args.stop.as_deref() {
+        Some(s) => s.parse().with_context(|| format!("bad --stop '{s}'"))?,
+        None => base.stop,
+    };
+    let target1 = match args.target1.as_deref() {
+        Some(s) => s.parse().with_context(|| format!("bad --target1 '{s}'"))?,
+        None => base.target1,
+    };
+    let target2 = match args.target2.as_deref() {
+        Some(s) if s.trim().eq_ignore_ascii_case("none") => None,
+        Some(s) => Some(s.parse().with_context(|| format!("bad --target2 '{s}'"))?),
+        None => base.target2,
+    };
+    Ok(RiskModel::new(stop, target1, target2))
+}
 
 /// Resolve the active horizon profile: `--horizon` flag overrides `SE_HORIZON`/config.
 pub fn resolve_profile(cfg: &AppConfig, horizon: Option<&str>) -> Result<HorizonProfile> {
@@ -53,8 +82,12 @@ pub async fn run_search(
     from: Option<String>,
     to: Option<String>,
     promote_dry_run: bool,
+    risk_args: RiskArgs,
 ) -> Result<()> {
     let profile = resolve_profile(cfg, horizon.as_deref())?;
+    let risk = resolve_risk(cfg, &risk_args)?;
+    // The CLI flag wins; otherwise the config's SE_LOCK_RISK.
+    let lock_risk = risk_args.lock_risk || cfg.lock_risk;
 
     let store = Store::connect(&cfg.database_url)
         .await
@@ -80,6 +113,8 @@ pub async fn run_search(
     search_cfg.from = session_close(from_date);
     search_cfg.to = session_close(to_date);
     search_cfg.score = ScoreConfig::default();
+    search_cfg.risk = risk;
+    search_cfg.lock_risk = lock_risk;
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
@@ -93,6 +128,15 @@ pub async fn run_search(
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
         "ranking key: OUT-OF-SAMPLE ONLY (oos_expectancy, dsr) — in-sample fit is never ranked."
+    );
+    println!(
+        "operator ground-rule risk: {} │ {}",
+        risk.describe(),
+        if lock_risk {
+            "LOCKED (conditions optimized; risk geometry fixed)"
+        } else {
+            "EXPLORED (search optimizes risk geometry on the OOS scoreboard)"
+        }
     );
 
     println!("materializing per-bar feature windows across the universe (one-time) ...");

@@ -153,6 +153,17 @@ fn jitter(v: f64, rng: &mut Rng) -> f64 {
     (v.abs() * factor).max(1e-6)
 }
 
+/// Decide a seeded genome's risk geometry: pin to the operator's model when `lock_risk`, else
+/// sample a fresh geometry from the space. Pure helper so the locked-vs-explore policy is unit
+/// testable without a DB/worker.
+pub fn seed_risk(space: &RiskSpace, lock_risk: bool, rng: &mut Rng) -> RiskModel {
+    if lock_risk {
+        space.operator
+    } else {
+        space.sample(rng)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +246,30 @@ mod tests {
         let c = s.crossover(&a, &b, &mut r);
         assert!(c.stop == a.stop || c.stop == b.stop);
         assert!(c.target1 == a.target1 || c.target1 == b.target1);
+    }
+
+    #[test]
+    fn locked_pins_every_genome_to_operator_model() {
+        let op = RiskModel::new(StopSpec::fixed(5.0), TargetSpec::r_multiple(2.0), None);
+        let s = RiskSpace::new(op);
+        let mut r = Rng::seeded(1, 0);
+        for _ in 0..20 {
+            // lock_risk = true => always the operator's exact model, no exploration.
+            assert_eq!(seed_risk(&s, true, &mut r), op);
+        }
+    }
+
+    #[test]
+    fn unlocked_explores_multiple_geometries() {
+        let s = space();
+        let mut r = Rng::seeded(1, 0);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            seen.insert(seed_risk(&s, false, &mut r).describe());
+        }
+        assert!(
+            seen.len() > 1,
+            "unlocked search must explore >1 risk geometry, saw {seen:?}"
+        );
     }
 }

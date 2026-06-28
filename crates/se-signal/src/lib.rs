@@ -2,8 +2,9 @@
 //! concrete, executable [`se_core::Signal`] and persist it.
 //!
 //! Geometry: entry at the latest close (a conservative last-close convention; the journal then
-//! fills next-bar-open-or-worse). Stop = entry ∓ `stop_atr_mult · ATR`; target1 = entry ±
-//! `target_atr_mult · ATR`; target2 at ×1.6 of the target distance. Conviction is a
+//! fills next-bar-open-or-worse). Stop/target1/target2 come from the genome's evolved
+//! [`se_core::RiskModel`] (the geometry the OOS scoreboard kept) resolved against the current
+//! ATR + entry — ATR multiples, fixed dollars, percent, or R-multiples. Conviction is a
 //! clearly-labeled cohort hit-rate proxy from the strategy's OOS expectancy (see
 //! [`conviction`]) — we do not invent a calibrated probability. `why` renders the genome's
 //! predicates as [`se_core::Driver`]s. Cohort stats (n, expectancy, CVaR) come from the
@@ -175,13 +176,13 @@ pub async fn build_signal_for(
     };
 
     let side = strategy.genome.side;
-    let s = side.sign();
     let entry = bar.close;
-    let stop = entry - s * profile.stop_atr_mult * atr_val;
-    let target1 = entry + s * profile.target_atr_mult * atr_val;
-    // Second target at 1.6x the first target distance from entry.
+    // Geometry comes from the genome's evolved risk model (stop/target1/target2), not the
+    // profile mults — so the signal honors exactly the geometry the OOS scoreboard kept.
+    let risk = &strategy.genome.risk;
+    let stop = risk.stop_price(entry, atr_val, side);
+    let (target1, target2) = risk.target_prices(entry, atr_val, side);
     let target1_dist = (target1 - entry).abs();
-    let target2 = Some(entry + s * 1.6 * target1_dist);
 
     let rr1 = if (entry - stop).abs() > 0.0 {
         target1_dist / (entry - stop).abs()
@@ -351,5 +352,60 @@ mod tests {
     fn invalidation_is_directional() {
         assert!(invalidation_rule(Side::Long, 120.0).contains("< 120"));
         assert!(invalidation_rule(Side::Short, 120.0).contains("> 120"));
+    }
+
+    #[test]
+    fn signal_geometry_honors_genome_risk_model() {
+        use se_core::{RegimeLabel, RiskModel, SignalId, StopSpec, StrategyId, TargetSpec, Ticker};
+
+        // A genome with a fixed $5 stop and 2R/3R targets.
+        let g = Genome::with_risk(
+            Side::Long,
+            Horizon::Swing,
+            vec![Predicate {
+                layer: Layer::Trigger,
+                feature_key: "trigger.rsi14".into(),
+                op: CmpOp::Gt,
+                threshold: 55.0,
+            }],
+            RiskModel::new(
+                StopSpec::fixed(5.0),
+                TargetSpec::r_multiple(2.0),
+                Some(TargetSpec::r_multiple(3.0)),
+            ),
+        );
+        // Resolve geometry exactly as build_signal_for does.
+        let entry = 100.0;
+        let atr = 2.0; // irrelevant for a fixed stop
+        let stop = g.risk.stop_price(entry, atr, g.side);
+        let (t1, t2) = g.risk.target_prices(entry, atr, g.side);
+        assert!((stop - 95.0).abs() < 1e-9); // $5 below
+        assert!((t1 - 110.0).abs() < 1e-9); // 2R = $10 above
+        assert!((t2.unwrap() - 115.0).abs() < 1e-9); // 3R = $15 above
+
+        // Signal::new must accept this geometry (directionally consistent).
+        let sig = Signal::new(
+            StrategyId::new(),
+            Ticker::Spy,
+            g.side,
+            se_core::DecisionTs::new(Utc::now()),
+            g.horizon,
+            entry,
+            stop,
+            t1,
+            t2,
+            0.5,
+            50,
+            RegimeLabel::RiskOn,
+            "risk_on",
+            drivers_for(&g, &BTreeMap::from([("trigger.rsi14".to_string(), 60.0)])),
+            invalidation_rule(g.side, stop),
+            0.2,
+            -1.0,
+            "test",
+        )
+        .expect("fixed-dollar risk geometry must build a valid signal");
+        assert!((sig.rr1 - 2.0).abs() < 1e-9, "rr1={}", sig.rr1);
+        let _ = SignalId::new();
     }
 }

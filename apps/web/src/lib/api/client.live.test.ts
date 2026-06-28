@@ -68,6 +68,33 @@ describe('live-API client', () => {
     expect(signals[0].signalId).toBe('sig_live_1');
   });
 
+  it('appends from/to query params to the live request', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { getSignals } = await import('./client');
+    await getSignals(undefined, { from: '2026-06-01', to: '2026-06-30' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${API_BASE}/api/signals?from=2026-06-01&to=2026-06-30`,
+      expect.objectContaining({ headers: { accept: 'application/json' } })
+    );
+  });
+
+  it('omits absent bounds and the query string entirely when unbounded', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse([]));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { getJournal } = await import('./client');
+    await getJournal(undefined, { from: '2026-06-01' });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `${API_BASE}/api/journal?from=2026-06-01`,
+      expect.anything()
+    );
+
+    await getJournal(undefined, {});
+    expect(fetchMock).toHaveBeenLastCalledWith(`${API_BASE}/api/journal`, expect.anything());
+  });
+
   it('falls back to fixtures when the backend errors', async () => {
     const fetchMock = vi.fn(async () => jsonResponse(null, false, 500));
     vi.stubGlobal('fetch', fetchMock);

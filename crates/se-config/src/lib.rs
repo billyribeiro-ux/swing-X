@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use se_core::{Error, Horizon, HorizonProfile, Result, Ticker};
+use se_core::{Error, Horizon, HorizonProfile, Result, RiskModel, StopSpec, TargetSpec, Ticker};
 
 /// Fully-resolved application configuration.
 #[derive(Debug, Clone)]
@@ -18,6 +18,12 @@ pub struct AppConfig {
     pub universe: Vec<Ticker>,
     pub fmp_configured: bool,
     pub fred_configured: bool,
+    /// Operator's ground-rule risk geometry (stop/target). From `SE_STOP`/`SE_TARGET1`/
+    /// `SE_TARGET2`, falling back to the active horizon's profile geometry.
+    pub risk: RiskModel,
+    /// Whether the search locks risk to `risk` (ground rules fixed; conditions optimized) or
+    /// explores it. From `SE_LOCK_RISK`.
+    pub lock_risk: bool,
 }
 
 impl AppConfig {
@@ -45,16 +51,59 @@ impl AppConfig {
             .map(|k| !k.is_empty())
             .unwrap_or(false);
 
+        let profile = HorizonProfile::for_horizon(horizon);
+        let risk = resolve_risk(&profile)?;
+        let lock_risk = std::env::var("SE_LOCK_RISK")
+            .ok()
+            .map(|v| parse_bool(&v))
+            .unwrap_or(false);
+
         Ok(AppConfig {
             database_url,
             ml_worker_url,
             api_bind,
-            horizon: HorizonProfile::for_horizon(horizon),
+            horizon: profile,
             universe: Ticker::ALL.to_vec(),
             fmp_configured,
             fred_configured,
+            risk,
+            lock_risk,
         })
     }
+}
+
+/// Resolve the operator's ground-rule [`RiskModel`] from `SE_STOP`/`SE_TARGET1`/`SE_TARGET2`,
+/// each falling back to the horizon profile's default geometry when unset.
+fn resolve_risk(profile: &HorizonProfile) -> Result<RiskModel> {
+    let default = RiskModel::from_profile(profile);
+    let stop: StopSpec = match std::env::var("SE_STOP") {
+        Ok(s) if !s.trim().is_empty() => {
+            s.parse().map_err(|e: Error| Error::Config(e.to_string()))?
+        }
+        _ => default.stop,
+    };
+    let target1: TargetSpec = match std::env::var("SE_TARGET1") {
+        Ok(s) if !s.trim().is_empty() => {
+            s.parse().map_err(|e: Error| Error::Config(e.to_string()))?
+        }
+        _ => default.target1,
+    };
+    // SE_TARGET2 unset => keep the profile default's second target. Empty/"none" => drop it.
+    let target2: Option<TargetSpec> = match std::env::var("SE_TARGET2") {
+        Ok(s) if s.trim().eq_ignore_ascii_case("none") => None,
+        Ok(s) if !s.trim().is_empty() => {
+            Some(s.parse().map_err(|e: Error| Error::Config(e.to_string()))?)
+        }
+        _ => default.target2,
+    };
+    Ok(RiskModel::new(stop, target1, target2))
+}
+
+fn parse_bool(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Minimal `.env` loader: `KEY=VALUE` lines, `#` comments, blanks ignored.
@@ -76,6 +125,21 @@ pub fn load_dotenv(path: &Path) {
         if std::env::var_os(key).is_none() {
             // SAFETY: single-threaded config load at process startup.
             unsafe { std::env::set_var(key, val) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_truthy() {
+        for t in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_bool(t), "{t} should be true");
+        }
+        for f in ["0", "false", "no", "", "off"] {
+            assert!(!parse_bool(f), "{f} should be false");
         }
     }
 }

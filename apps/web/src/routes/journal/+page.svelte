@@ -6,6 +6,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import Metric from '$lib/components/Metric.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import DateRangePicker from '$lib/components/DateRangePicker.svelte';
   import { sideBadgeClass, signTextClass } from '$lib/ui/theme';
   import { fmtPct, fmtPrice, fmtR, fmtTs } from '$lib/format';
   import type { PageData } from './$types';
@@ -108,7 +109,11 @@
 <PageHeader
   title="Paper-Trade Journal"
   subtitle="Every fill linked to its originating signal and strategy, with an attribution snapshot."
-/>
+>
+  {#snippet actions()}
+    <DateRangePicker />
+  {/snippet}
+</PageHeader>
 
 <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
   <Metric label="Total R (closed)" value={fmtR(totalR)} valueClass={signTextClass(totalR)} />

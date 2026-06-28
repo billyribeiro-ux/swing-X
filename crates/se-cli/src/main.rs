@@ -86,6 +86,18 @@ struct SearchArgs {
     /// Inclusive window end (YYYY-MM-DD). Default: today.
     #[arg(long)]
     to: Option<String>,
+    /// Ground-rule stop geometry: `atr:1.0` | `fixed:5.35` | `pct:2.5`. Default: horizon/config.
+    #[arg(long)]
+    stop: Option<String>,
+    /// Ground-rule primary target: `r:2.0` | `atr:2.0` | `fixed:10` | `pct:3`. Default: config.
+    #[arg(long)]
+    target1: Option<String>,
+    /// Ground-rule second target (same forms, or `none` to drop it). Default: config.
+    #[arg(long)]
+    target2: Option<String>,
+    /// Lock risk to the operator's ground rules (optimize only the conditions). Default: explore.
+    #[arg(long, default_value_t = false)]
+    lock_risk: bool,
 }
 
 #[derive(Args)]
@@ -106,6 +118,18 @@ struct PromoteArgs {
     from: Option<String>,
     #[arg(long)]
     to: Option<String>,
+    /// Ground-rule stop geometry: `atr:1.0` | `fixed:5.35` | `pct:2.5`. Default: horizon/config.
+    #[arg(long)]
+    stop: Option<String>,
+    /// Ground-rule primary target: `r:2.0` | `atr:2.0` | `fixed:10` | `pct:3`. Default: config.
+    #[arg(long)]
+    target1: Option<String>,
+    /// Ground-rule second target (same forms, or `none` to drop it). Default: config.
+    #[arg(long)]
+    target2: Option<String>,
+    /// Lock risk to the operator's ground rules (optimize only the conditions). Default: explore.
+    #[arg(long, default_value_t = false)]
+    lock_risk: bool,
 }
 
 #[derive(Args)]
@@ -164,6 +188,12 @@ async fn main() -> Result<()> {
             sanity::run(&store, &[Ticker::Spy, Ticker::Qqq]).await?;
         }
         Cmd::Search(args) => {
+            let risk = search_cmd::RiskArgs {
+                stop: args.stop,
+                target1: args.target1,
+                target2: args.target2,
+                lock_risk: args.lock_risk,
+            };
             search_cmd::run_search(
                 &cfg,
                 args.generations,
@@ -172,10 +202,17 @@ async fn main() -> Result<()> {
                 args.from,
                 args.to,
                 false,
+                risk,
             )
             .await?;
         }
         Cmd::Promote(args) => {
+            let risk = search_cmd::RiskArgs {
+                stop: args.stop,
+                target1: args.target1,
+                target2: args.target2,
+                lock_risk: args.lock_risk,
+            };
             search_cmd::run_search(
                 &cfg,
                 args.generations,
@@ -184,6 +221,7 @@ async fn main() -> Result<()> {
                 args.from,
                 args.to,
                 args.dry_run,
+                risk,
             )
             .await?;
         }

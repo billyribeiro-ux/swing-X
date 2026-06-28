@@ -86,7 +86,10 @@ impl std::fmt::Display for LabelError {
                 write!(f, "stop_atr_mult must be > 0 (defines the R unit)")
             }
             LabelError::NonPositiveRisk => {
-                write!(f, "risk model stop distance must be > 0 (defines the R unit)")
+                write!(
+                    f,
+                    "risk model stop distance must be > 0 (defines the R unit)"
+                )
             }
             LabelError::ZeroMaxHold => write!(f, "max_hold_bars must be >= 1"),
         }
@@ -200,9 +203,10 @@ impl TripleBarrier {
         let entry = bars[entry_idx];
         let entry_px = entry.close;
 
-        // Resolve the geometry from the risk model. The stop distance is one R.
+        // Resolve the geometry from the risk model. The stop distance is one R; it is a
+        // magnitude (non-negative) so a `<= 0` or non-finite value means a degenerate stop.
         let risk_dist = risk.risk_distance(entry_px, atr);
-        if !(risk_dist > 0.0) || !risk_dist.is_finite() {
+        if risk_dist <= 0.0 || !risk_dist.is_finite() {
             return Err(LabelError::NonPositiveRisk);
         }
         let stop_px = risk.stop_price(entry_px, atr, side);

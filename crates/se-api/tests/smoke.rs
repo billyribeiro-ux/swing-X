@@ -70,8 +70,7 @@ async fn health_and_signals_smoke() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = res.into_body().collect().await.unwrap().to_bytes();
-    let v: serde_json::Value =
-        serde_json::from_slice(&body).expect("ranged signals is JSON");
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("ranged signals is JSON");
     assert!(
         v.is_array(),
         "GET /api/signals?from&to must return a JSON array"

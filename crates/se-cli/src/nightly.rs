@@ -35,6 +35,18 @@ pub struct NightlyArgs {
     /// Horizon override (P8 axis). Defaults to SE_HORIZON / config.
     #[arg(long)]
     pub horizon: Option<String>,
+    /// Ground-rule stop geometry: `atr:1.0` | `fixed:5.35` | `pct:2.5`. Default: horizon/config.
+    #[arg(long)]
+    pub stop: Option<String>,
+    /// Ground-rule primary target: `r:2.0` | `atr:2.0` | `fixed:10` | `pct:3`. Default: config.
+    #[arg(long)]
+    pub target1: Option<String>,
+    /// Ground-rule second target (same forms, or `none` to drop it). Default: config.
+    #[arg(long)]
+    pub target2: Option<String>,
+    /// Lock risk to the operator's ground rules (optimize only the conditions). Default: explore.
+    #[arg(long, default_value_t = false)]
+    pub lock_risk: bool,
 }
 
 pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
@@ -92,6 +104,12 @@ pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
                 other => bail!("unknown provider '{other}'"),
             },
             Step::Search => {
+                let risk = search_cmd::RiskArgs {
+                    stop: args.stop.clone(),
+                    target1: args.target1.clone(),
+                    target2: args.target2.clone(),
+                    lock_risk: args.lock_risk,
+                };
                 search_cmd::run_search(
                     cfg,
                     args.generations,
@@ -100,6 +118,7 @@ pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
                     Some(from.to_string()),
                     Some(to.to_string()),
                     false,
+                    risk,
                 )
                 .await?;
             }

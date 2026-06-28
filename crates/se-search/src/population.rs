@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt;
 use se_core::{
-    Genome, HorizonProfile, RiskModel, Result, Strategy, StrategyId, StrategyStatus, Ticker,
+    Genome, HorizonProfile, Result, RiskModel, Strategy, StrategyId, StrategyStatus, Ticker,
 };
 use se_store::Store;
 use se_validation::ValidationHarness;
@@ -69,6 +69,13 @@ pub struct SearchConfig {
     pub min_feature_obs: usize,
     /// OOS scoring shape.
     pub score: ScoreConfig,
+    /// The operator's ground-rule risk geometry (stop/target). Seeds/mutations explore around
+    /// it, or — if [`SearchConfig::lock_risk`] — every genome is pinned to exactly this model.
+    pub risk: RiskModel,
+    /// When true, the operator's `risk` model is fixed: the search optimizes only the entry
+    /// conditions. When false (default), risk geometry is explored and the OOS scoreboard keeps
+    /// the best one.
+    pub lock_risk: bool,
 }
 
 /// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
@@ -87,6 +94,10 @@ impl SearchConfig {
             max_predicates: 3,
             min_feature_obs: 30,
             score: ScoreConfig::default(),
+            // Default ground rules: the legacy profile geometry (so a search with no `--stop`
+            // flag behaves exactly as before, while still being explored).
+            risk: RiskModel::from_profile(&profile),
+            lock_risk: false,
         }
     }
 }
@@ -99,6 +110,8 @@ pub struct PopulationManager<'a> {
     /// Materialized feature windows per ticker (computed once, reused every generation).
     windows: Vec<FeatureWindow>,
     catalog: FeatureCatalog,
+    /// The risk-geometry sampling space (built around the operator's ground-rule model).
+    risk_space: RiskSpace,
 }
 
 impl<'a> PopulationManager<'a> {
@@ -126,13 +139,22 @@ impl<'a> PopulationManager<'a> {
             windows.push(w);
         }
         let catalog = FeatureCatalog::from_windows(&windows, cfg.min_feature_obs);
+        let risk_space = RiskSpace::new(cfg.risk);
         Ok(PopulationManager {
             store,
             harness,
             cfg,
             windows,
             catalog,
+            risk_space,
         })
+    }
+
+    /// Apply the risk geometry to a genome: pin to the operator's model when locked, otherwise
+    /// sample a fresh geometry from the configurable space.
+    fn assign_seed_risk(&self, mut g: Genome, rng: &mut Rng) -> Genome {
+        g.risk = crate::risk_search::seed_risk(&self.risk_space, self.cfg.lock_risk, rng);
+        g
     }
 
     /// The feature catalog the search draws from (observed keys + quantiles).
@@ -214,6 +236,9 @@ impl<'a> PopulationManager<'a> {
                 // Cohort size (entry count) so signal generation can report a real `cohort_n`
                 // without re-backtesting.
                 "n_entries": ev.n_entries,
+                // The risk geometry this genome was scored on (provenance for the scoreboard).
+                "risk": ev.strategy.genome.risk,
+                "lock_risk": self.cfg.lock_risk,
             });
             persist::insert_oos_score(self.store, score, &fold_spec).await?;
         }
@@ -282,7 +307,8 @@ impl<'a> PopulationManager<'a> {
                 }
             };
 
-        // Carry survivors forward (elitism) + their mutations and pairwise crossovers.
+        // Carry survivors forward (elitism) + their mutations and pairwise crossovers. Survivors
+        // keep their own (already-scored) risk geometry — that geometry is part of what won.
         for g in survivors {
             push(g.clone(), &mut seen, &mut genomes);
         }
@@ -290,26 +316,30 @@ impl<'a> PopulationManager<'a> {
             if genomes.len() >= per_gen {
                 break;
             }
-            push(
-                genome_ops::mutate(g, &self.catalog, rng),
-                &mut seen,
-                &mut genomes,
-            );
+            // Mutate predicates, then (unless locked) also perturb the risk geometry so risk and
+            // conditions co-evolve.
+            let mut m = genome_ops::mutate(g, &self.catalog, rng);
+            if !self.cfg.lock_risk {
+                m.risk = self.risk_space.mutate(&g.risk, rng);
+            }
+            push(m, &mut seen, &mut genomes);
         }
         if survivors.len() >= 2 {
             for pair in survivors.windows(2) {
                 if genomes.len() >= per_gen {
                     break;
                 }
-                push(
-                    genome_ops::crossover(&pair[0], &pair[1], rng),
-                    &mut seen,
-                    &mut genomes,
-                );
+                let mut c = genome_ops::crossover(&pair[0], &pair[1], rng);
+                c.risk = if self.cfg.lock_risk {
+                    self.cfg.risk
+                } else {
+                    self.risk_space.crossover(&pair[0].risk, &pair[1].risk, rng)
+                };
+                push(c, &mut seen, &mut genomes);
             }
         }
 
-        // Top up with fresh seeds.
+        // Top up with fresh seeds, each given a sampled (or locked) risk geometry.
         if genomes.len() < per_gen {
             let need = per_gen - genomes.len();
             let fresh = seed_population(
@@ -323,7 +353,7 @@ impl<'a> PopulationManager<'a> {
                 if genomes.len() >= per_gen {
                     break;
                 }
-                push(g, &mut seen, &mut genomes);
+                push(self.assign_seed_risk(g, rng), &mut seen, &mut genomes);
             }
         }
 

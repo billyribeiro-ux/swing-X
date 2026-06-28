@@ -1,6 +1,7 @@
 <script lang="ts">
   import Badge from '$lib/components/Badge.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import DateRangePicker from '$lib/components/DateRangePicker.svelte';
   import { actionBadgeClass, actionSeverity, severityRailClass } from '$lib/ui/theme';
   import { fmtSigned, fmtTs, humanize } from '$lib/format';
   import type { PageData } from './$types';
@@ -17,6 +18,7 @@
   subtitle="Forward-adaptation detectors and the actions the engine took. Newest first."
 >
   {#snippet actions()}
+    <DateRangePicker />
     <span
       class="num rounded border px-2 py-1 text-xs {highCount > 0
         ? 'border-down/40 bg-down/10 text-down'

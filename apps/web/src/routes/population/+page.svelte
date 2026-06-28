@@ -5,6 +5,7 @@
   import Badge from '$lib/components/Badge.svelte';
   import GatePill from '$lib/components/GatePill.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import DateRangePicker from '$lib/components/DateRangePicker.svelte';
   import { statusBadgeClass } from '$lib/ui/theme';
   import { fmtR, fmtRatio, fmtSigned, fmtUnit, humanize } from '$lib/format';
   import type { PageData } from './$types';
@@ -177,6 +178,7 @@
   subtitle="Evolving genomes ranked by overfit-penalized, cost-aware OOS metrics. Win rate is intentionally omitted — it is a banned selection metric."
 >
   {#snippet actions()}
+    <DateRangePicker />
     <span class="num rounded border border-base-800 bg-base-900/60 px-2 py-1 text-xs text-base-300">
       {promotedCount} promoted / {data.population.length} total
     </span>

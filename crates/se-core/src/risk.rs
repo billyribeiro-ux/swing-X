@@ -94,11 +94,19 @@ impl FromStr for StopSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetSpec {
-    Atr { mult: f64 },
-    Fixed { dollars: f64 },
-    Percent { pct: f64 },
+    Atr {
+        mult: f64,
+    },
+    Fixed {
+        dollars: f64,
+    },
+    Percent {
+        pct: f64,
+    },
     /// `N ×` the risk (entry->stop) distance.
-    RMultiple { r: f64 },
+    RMultiple {
+        r: f64,
+    },
 }
 
 impl TargetSpec {
@@ -227,11 +235,7 @@ impl RiskModel {
     }
 
     /// Parse a risk model from operator config strings.
-    pub fn parse(
-        stop: &str,
-        target1: &str,
-        target2: Option<&str>,
-    ) -> Result<Self, Error> {
+    pub fn parse(stop: &str, target1: &str, target2: Option<&str>) -> Result<Self, Error> {
         Ok(RiskModel {
             stop: stop.parse()?,
             target1: target1.parse()?,
@@ -267,7 +271,9 @@ impl Default for RiskModel {
 fn split_spec(s: &str) -> Result<(String, String), Error> {
     let trimmed = s.trim();
     let (kind, raw) = trimmed.split_once(':').ok_or_else(|| {
-        Error::Config(format!("risk spec '{s}' must be 'kind:value' (e.g. atr:1.0)"))
+        Error::Config(format!(
+            "risk spec '{s}' must be 'kind:value' (e.g. atr:1.0)"
+        ))
     })?;
     Ok((
         kind.trim().to_ascii_lowercase(),
@@ -276,9 +282,11 @@ fn split_spec(s: &str) -> Result<(String, String), Error> {
 }
 
 fn parse_num(raw: &str, full: &str) -> Result<f64, Error> {
-    raw.trim()
-        .parse::<f64>()
-        .map_err(|_| Error::Config(format!("risk spec '{full}' has a non-numeric value '{raw}'")))
+    raw.trim().parse::<f64>().map_err(|_| {
+        Error::Config(format!(
+            "risk spec '{full}' has a non-numeric value '{raw}'"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -361,7 +369,10 @@ mod tests {
             "fixed:5.35".parse::<StopSpec>().unwrap(),
             StopSpec::fixed(5.35)
         );
-        assert_eq!("pct:2.5".parse::<StopSpec>().unwrap(), StopSpec::percent(2.5));
+        assert_eq!(
+            "pct:2.5".parse::<StopSpec>().unwrap(),
+            StopSpec::percent(2.5)
+        );
         // Case-insensitive + $ shorthand.
         assert_eq!("ATR:2".parse::<StopSpec>().unwrap(), StopSpec::atr(2.0));
         assert_eq!(

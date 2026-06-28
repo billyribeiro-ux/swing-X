@@ -27,8 +27,8 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use serde::Deserialize;
 use se_store::Store;
+use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use crate::queries::DateBounds;

@@ -5,6 +5,7 @@ import { populationFixtures } from '$lib/fixtures/population';
 import { monitorFixtures } from '$lib/fixtures/monitor';
 import { journalFixtures } from '$lib/fixtures/journal';
 import { changelogFixtures } from '$lib/fixtures/changelog';
+import { filterByRange, type DateRange } from '$lib/date-range';
 import {
   changelogSchema,
   journalSchema,
@@ -60,26 +61,48 @@ function settle<T>(value: T): Promise<T> {
 }
 
 /**
- * Live-or-fixture resolver. When a backend is configured it fetches `path`, parses
- * the body with `schema`, and returns the result; on any error (network, non-2xx,
- * or schema mismatch) it logs a warning and returns the cloned `fixture`. When no
- * backend is configured it returns the fixture directly.
+ * Append a `?from=&to=` window to a path. Only present bounds are emitted so a
+ * bare range leaves the path unchanged (and the backend stays unfiltered).
  */
-async function resolve<T>(
+function withRange(path: string, range?: DateRange): string {
+  if (!range || (!range.from && !range.to)) return path;
+  const params = new URLSearchParams();
+  if (range.from) params.set('from', range.from);
+  if (range.to) params.set('to', range.to);
+  return `${path}?${params.toString()}`;
+}
+
+/**
+ * Live-or-fixture resolver with an optional date window.
+ *
+ * Live mode: appends `from`/`to` to the request path so the Rust API does the
+ * filtering, then parses the body with `schema`. On any error (network, non-2xx,
+ * or schema mismatch) it logs a warning and falls back to the range-filtered
+ * fixture.
+ *
+ * Fixture mode (no `PUBLIC_API_BASE`): filters the bundled fixture client-side by
+ * `range` (via `dateKey`) so the picker still visibly works offline. When no
+ * `dateKey` is given the fixture is returned as-is.
+ */
+async function resolve<T extends object>(
   path: string,
-  schema: z.ZodType<T>,
-  fixture: T,
-  fetchFn: typeof fetch = fetch
-): Promise<T> {
+  schema: z.ZodType<T[]>,
+  fixture: T[],
+  fetchFn: typeof fetch = fetch,
+  range?: DateRange,
+  dateKey?: (row: T) => string
+): Promise<T[]> {
   if (!usingLiveApi) {
-    return settle(clone(fixture));
+    const rows = dateKey && range ? filterByRange(fixture, range, dateKey) : fixture;
+    return settle(clone(rows));
   }
   try {
-    const raw = await getJson(path, fetchFn);
+    const raw = await getJson(withRange(path, range), fetchFn);
     return schema.parse(raw);
   } catch (err) {
     console.warn(`[api] falling back to fixtures for ${path}:`, err);
-    return clone(fixture);
+    const rows = dateKey && range ? filterByRange(fixture, range, dateKey) : fixture;
+    return clone(rows);
   }
 }
 
@@ -87,8 +110,8 @@ async function resolve<T>(
 // Public API surface
 // ---------------------------------------------------------------------------
 
-export function getSignals(fetchFn?: typeof fetch): Promise<Signal[]> {
-  return resolve('/api/signals', signalsSchema, signalFixtures, fetchFn);
+export function getSignals(fetchFn?: typeof fetch, range?: DateRange): Promise<Signal[]> {
+  return resolve('/api/signals', signalsSchema, signalFixtures, fetchFn, range, (s) => s.decisionTs);
 }
 
 export async function getSignal(id: string, fetchFn?: typeof fetch): Promise<Signal | null> {
@@ -111,16 +134,25 @@ export async function getSignal(id: string, fetchFn?: typeof fetch): Promise<Sig
   }
 }
 
-export function getPopulation(fetchFn?: typeof fetch): Promise<Strategy[]> {
-  return resolve('/api/population', populationSchema, populationFixtures, fetchFn);
+export function getPopulation(fetchFn?: typeof fetch, range?: DateRange): Promise<Strategy[]> {
+  // Window strategies by their freshness timestamp — the latest OOS score's
+  // `evaluatedAt` when present (matching the backend's COALESCE on `created_at`).
+  return resolve(
+    '/api/population',
+    populationSchema,
+    populationFixtures,
+    fetchFn,
+    range,
+    (s) => s.latestScore?.evaluatedAt ?? ''
+  );
 }
 
-export function getMonitorEvents(fetchFn?: typeof fetch): Promise<MonitorEvent[]> {
-  return resolve('/api/monitor', monitorEventsSchema, monitorFixtures, fetchFn);
+export function getMonitorEvents(fetchFn?: typeof fetch, range?: DateRange): Promise<MonitorEvent[]> {
+  return resolve('/api/monitor', monitorEventsSchema, monitorFixtures, fetchFn, range, (e) => e.ts);
 }
 
-export function getJournal(fetchFn?: typeof fetch): Promise<Trade[]> {
-  return resolve('/api/journal', journalSchema, journalFixtures, fetchFn);
+export function getJournal(fetchFn?: typeof fetch, range?: DateRange): Promise<Trade[]> {
+  return resolve('/api/journal', journalSchema, journalFixtures, fetchFn, range, (t) => t.entryTs);
 }
 
 export function getChangelog(fetchFn?: typeof fetch): Promise<ChangelogWeek[]> {

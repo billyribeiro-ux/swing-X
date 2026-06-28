@@ -6,6 +6,7 @@
   import type { Column } from '$lib/components/data-table';
   import Badge from '$lib/components/Badge.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import DateRangePicker from '$lib/components/DateRangePicker.svelte';
   import ConvictionBar from '$lib/components/ConvictionBar.svelte';
   import { sideBadgeClass, signTextClass } from '$lib/ui/theme';
   import { fmtInt, fmtLeadTime, fmtPrice, fmtR, fmtRatio, humanize } from '$lib/format';
@@ -128,6 +129,7 @@
   subtitle="Surfaced, executable signals across the 10-ETF universe. Click a row for full attribution."
 >
   {#snippet actions()}
+    <DateRangePicker />
     <span class="num rounded border border-base-800 bg-base-900/60 px-2 py-1 text-xs text-base-300">
       {data.signals.length} live · {humanize('out_of_distribution')} guarded
     </span>
