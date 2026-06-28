@@ -1,0 +1,40 @@
+name: rust
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: timescale/timescaledb:latest-pg16
+        env:
+          POSTGRES_USER: swing
+          POSTGRES_PASSWORD: swing
+          POSTGRES_DB: swing
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U swing -d swing"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://swing:swing@localhost:5433/swing
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        # FMP_API_KEY is absent in CI, so live-provider tests skip themselves.
+        run: cargo test --workspace

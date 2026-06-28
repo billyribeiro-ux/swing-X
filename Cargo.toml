@@ -28,6 +28,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+async-trait = "0.1"
+futures = "0.3"
 
 # errors / logging / config
 thiserror = "2"

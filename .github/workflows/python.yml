@@ -1,0 +1,27 @@
+name: python
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  ml-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ml-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Sync deps
+        run: uv sync --all-extras
+      - name: Lint (ruff)
+        run: uv run ruff check .
+      - name: Types (mypy)
+        run: uv run mypy src
+      - name: Tests (pytest)
+        # Includes the leakage-fixture checkpoint: the gate must reject a planted leak.
+        run: uv run pytest -q

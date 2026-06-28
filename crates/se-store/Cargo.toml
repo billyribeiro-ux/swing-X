@@ -8,3 +8,16 @@ publish = false
 
 [dependencies]
 se-core = { path = "../se-core" }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+se-core = { path = "../se-core" }
+tokio = { workspace = true }
+chrono = { workspace = true }

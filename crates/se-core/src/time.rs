@@ -66,6 +66,32 @@ pub enum LeadTimeTag {
     LaggedDays(i64),
 }
 
+impl LeadTimeTag {
+    /// Compact string form for DB storage / wire (`realtime`, `eod`, `next_open`, `lagged:7`).
+    pub fn to_tag_string(self) -> String {
+        match self {
+            LeadTimeTag::Realtime => "realtime".to_string(),
+            LeadTimeTag::EndOfDay => "eod".to_string(),
+            LeadTimeTag::NextOpen => "next_open".to_string(),
+            LeadTimeTag::LaggedDays(n) => format!("lagged:{n}"),
+        }
+    }
+
+    /// Parse the compact string form; unknown inputs fall back to [`LeadTimeTag::EndOfDay`].
+    pub fn parse_tag(s: &str) -> Self {
+        match s.trim() {
+            "realtime" => LeadTimeTag::Realtime,
+            "eod" => LeadTimeTag::EndOfDay,
+            "next_open" => LeadTimeTag::NextOpen,
+            other => other
+                .strip_prefix("lagged:")
+                .and_then(|n| n.parse::<i64>().ok())
+                .map(LeadTimeTag::LaggedDays)
+                .unwrap_or(LeadTimeTag::EndOfDay),
+        }
+    }
+}
+
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side {

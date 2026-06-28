@@ -8,3 +8,5 @@ publish = false
 
 [dependencies]
 se-core = { path = "../se-core" }
+serde = { workspace = true }
+tracing = { workspace = true }

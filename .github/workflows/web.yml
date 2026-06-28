@@ -1,0 +1,29 @@
+name: web
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+      - name: Install
+        run: pnpm install --no-frozen-lockfile
+      - name: Type-check (svelte-check, strict TS)
+        run: pnpm --filter @swing-x/web check
+      - name: Lint
+        run: pnpm --filter @swing-x/web lint
+      - name: Unit tests (vitest)
+        run: pnpm --filter @swing-x/web test
+      - name: Build
+        run: pnpm --filter @swing-x/web build

@@ -228,7 +228,11 @@ mod tests {
     fn purge_equals_label_horizon() {
         for h in Horizon::ALL {
             let p = HorizonProfile::for_horizon(h);
-            assert_eq!(p.purge_bars(), p.max_hold_bars, "purge must equal label horizon for {h:?}");
+            assert_eq!(
+                p.purge_bars(),
+                p.max_hold_bars,
+                "purge must equal label horizon for {h:?}"
+            );
         }
     }
 
@@ -238,6 +242,9 @@ mod tests {
             assert_eq!(h.as_str().parse::<Horizon>().unwrap(), h);
         }
         assert_eq!("0dte".replace('0', "zero_"), "zero_dte");
-        assert_eq!("short-swing".parse::<Horizon>().unwrap(), Horizon::ShortSwing);
+        assert_eq!(
+            "short-swing".parse::<Horizon>().unwrap(),
+            Horizon::ShortSwing
+        );
     }
 }
