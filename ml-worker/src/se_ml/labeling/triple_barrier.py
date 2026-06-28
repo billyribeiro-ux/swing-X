@@ -17,6 +17,13 @@ Within a single bar we cannot observe the high/low sequence, so when *both* the 
 and the stop lie inside a bar's [low, high] range we resolve the touch **against** the
 position — the stop is deemed hit first. This avoids optimistic first-touch assumptions
 that would inflate backtest edge.
+
+Status: REFERENCE. The authoritative labeler on the live path is the Rust ``se-labeler``
+(``crates/se-labeler/src/triple_barrier.rs``); the search/validation pipeline runs that one.
+This Python implementation exists for parity testing of the load-bearing conventions (the
+conservative both-barriers-in-one-bar => stop-wins rule and the R math) and is verified —
+including a cross-language parity sweep over every outcome x side — by
+``tests/test_triple_barrier.py``.
 """
 
 from __future__ import annotations

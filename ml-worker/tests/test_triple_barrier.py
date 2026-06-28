@@ -104,3 +104,44 @@ def test_entry_bar_not_used_for_touch():
     out = label_events(bars, events, target_mult=2.0, stop_mult=1.0, max_hold=1)
     # Should be TIME (bar 1 doesn't reach 102), not TARGET off the entry bar.
     assert out.iloc[0]["outcome"] == Outcome.TIME.value
+
+
+def test_matches_rust_labeler_convention_across_all_outcomes_and_sides():
+    """Cross-language parity: this Python REFERENCE labeler must agree with the authoritative
+    Rust `se-labeler` on every outcome x side. The scenarios + expected (outcome, R) mirror the
+    Rust sweep `label_one_equals_from_profile_across_all_outcomes_and_sides` exactly
+    (target_mult=2, stop_mult=1, atr=1, entry close=100 => long target 102/stop 99, short
+    target 98/stop 101; time exits realize signed close-move / R).
+    """
+    # (name, side, closes, highs, lows, expected_outcome, expected_ret_r)
+    scenarios = [
+        ("long_target", 1, [100, 101.0], [100, 102.5], [100, 100.5], Outcome.TARGET, 2.0),
+        ("long_stop", 1, [100, 99.2], [100, 100.5], [100, 98.5], Outcome.STOP, -1.0),
+        (
+            "long_time",
+            1,
+            [100, 100.2, 100.3, 100.4, 100.4, 100.5],
+            [100, 101, 101, 101, 101, 101],
+            [100, 99.5, 99.5, 99.5, 99.5, 99.5],
+            Outcome.TIME,
+            0.5,  # (100.5 - 100) / 1
+        ),
+        ("short_target", -1, [100, 98.0], [100, 100.5], [100, 97.5], Outcome.TARGET, 2.0),
+        ("short_stop", -1, [100, 100.8], [100, 101.5], [100, 99.5], Outcome.STOP, -1.0),
+        (
+            "short_time",
+            -1,
+            [100, 99.8, 99.7, 99.6, 99.6, 99.5],
+            [100, 100.5, 100.5, 100.5, 100.5, 100.5],
+            [100, 99, 99, 99, 99, 99],
+            Outcome.TIME,
+            0.5,  # -(99.5 - 100) / 1
+        ),
+    ]
+    for name, side, closes, highs, lows, want_outcome, want_r in scenarios:
+        bars = _bars(closes, highs, lows, atr=1.0)
+        events = pd.DataFrame({"ts": [bars["ts"].iloc[0]], "side": [side]})
+        out = label_events(bars, events, target_mult=2.0, stop_mult=1.0, max_hold=5)
+        row = out.iloc[0]
+        assert row["outcome"] == want_outcome.value, f"{name}: outcome"
+        assert np.isclose(row["ret_r"], want_r), f"{name}: ret_r={row['ret_r']}"
