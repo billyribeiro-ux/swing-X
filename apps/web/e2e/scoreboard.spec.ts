@@ -21,7 +21,8 @@ test('scoreboard loads, row click opens signal detail', async ({ page }) => {
   // Detail page shows the Why / driver-attribution panel.
   await expect(page.getByRole('heading', { name: 'Why — driver attribution' })).toBeVisible();
 
-  // And the back link returns to the scoreboard.
-  await page.getByRole('link', { name: 'Scoreboard' }).click();
+  // And the in-page back link (scoped to main, not the sidebar) returns to the
+  // scoreboard.
+  await page.getByRole('main').getByRole('link', { name: 'Scoreboard' }).click();
   await expect(page.getByRole('heading', { name: 'Signal Scoreboard' })).toBeVisible();
 });
