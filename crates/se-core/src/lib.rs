@@ -17,6 +17,8 @@ pub mod horizon;
 pub mod ids;
 pub mod layer;
 pub mod regime;
+pub mod signal;
+pub mod strategy;
 pub mod ticker;
 pub mod time;
 
@@ -26,5 +28,7 @@ pub use horizon::{Cadence, CostModel, Horizon, HorizonProfile};
 pub use ids::{LabelId, ModelId, SignalId, StrategyId, TradeId};
 pub use layer::Layer;
 pub use regime::RegimeLabel;
+pub use signal::{Driver, MonitorAction, Signal, Trade, TradeMode};
+pub use strategy::{CmpOp, Genome, Predicate, Strategy, StrategyStatus};
 pub use ticker::Ticker;
 pub use time::{AsOf, Bar, DecisionTs, LeadTimeTag, Side};
