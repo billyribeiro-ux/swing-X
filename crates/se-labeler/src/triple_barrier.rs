@@ -450,22 +450,95 @@ mod tests {
     use se_core::{RiskModel, StopSpec, TargetSpec};
 
     #[test]
-    fn label_one_matches_from_profile_risk_model() {
-        // The legacy path must equal the explicit RiskModel::from_profile path bar-for-bar.
-        let bars = vec![
-            bar(0, 100.0, 100.0, 100.0, 100.0),
-            bar(1, 100.0, 102.5, 100.5, 101.0),
-        ];
+    fn label_one_equals_from_profile_across_all_outcomes_and_sides() {
+        // The legacy `label_one` path must equal `label_one_with_risk(from_profile)` bar-for-bar
+        // for EVERY outcome (target / stop / time) on BOTH sides — the branches where a sign bug
+        // or wrong R denominator would hide. (Reloaded legacy genomes rely on this equivalence:
+        // a missing `risk` field is reconstructed via from_profile, so it must match the geometry
+        // those genomes were originally labeled and scored under.)
+        //
+        // Profile geometry with atr=1: Long target=102 stop=99; Short target=98 stop=101.
+        let atr = 1.0;
         let tb = TripleBarrier::new(profile());
-        let legacy = tb.label_one(&bars, 0, Side::Long, 1.0).unwrap();
         let rm = RiskModel::from_profile(tb.profile());
-        let explicit = tb
-            .label_one_with_risk(&bars, 0, Side::Long, 1.0, &rm)
-            .unwrap();
-        assert_eq!(legacy.target_px, explicit.target_px);
-        assert_eq!(legacy.stop_px, explicit.stop_px);
-        assert_eq!(legacy.outcome, explicit.outcome);
-        assert!((legacy.ret_r - explicit.ret_r).abs() < 1e-9);
+
+        // (name, side, post-entry bars, expected outcome, expected ret_r)
+        let scenarios: Vec<(&str, Side, Vec<Bar>, Outcome, f64)> = vec![
+            (
+                "long_target",
+                Side::Long,
+                vec![bar(1, 100.0, 102.5, 100.5, 101.0)], // high 102.5 >= 102
+                Outcome::Target,
+                2.0,
+            ),
+            (
+                "long_stop",
+                Side::Long,
+                vec![bar(1, 100.0, 100.5, 98.5, 99.2)], // low 98.5 <= 99, high < 102
+                Outcome::Stop,
+                -1.0,
+            ),
+            (
+                "long_time",
+                Side::Long,
+                // never touches 102 or 99; exits at close of the time-barrier bar (100.5).
+                vec![
+                    bar(1, 100.0, 101.0, 99.5, 100.2),
+                    bar(2, 100.2, 101.0, 99.5, 100.3),
+                    bar(3, 100.3, 101.0, 99.5, 100.4),
+                    bar(4, 100.4, 101.0, 99.5, 100.4),
+                    bar(5, 100.4, 101.0, 99.5, 100.5),
+                ],
+                Outcome::Time,
+                0.5, // (100.5 - 100) / 1
+            ),
+            (
+                "short_target",
+                Side::Short,
+                vec![bar(1, 100.0, 100.5, 97.5, 98.0)], // low 97.5 <= 98, high < 101
+                Outcome::Target,
+                2.0,
+            ),
+            (
+                "short_stop",
+                Side::Short,
+                vec![bar(1, 100.0, 101.5, 99.5, 100.8)], // high 101.5 >= 101, low > 98
+                Outcome::Stop,
+                -1.0,
+            ),
+            (
+                "short_time",
+                Side::Short,
+                // never touches 98 or 101; exits at close of the time-barrier bar (99.5).
+                vec![
+                    bar(1, 100.0, 100.5, 99.0, 99.8),
+                    bar(2, 99.8, 100.5, 99.0, 99.7),
+                    bar(3, 99.7, 100.5, 99.0, 99.6),
+                    bar(4, 99.6, 100.5, 99.0, 99.6),
+                    bar(5, 99.6, 100.5, 99.0, 99.5),
+                ],
+                Outcome::Time,
+                0.5, // -(99.5 - 100) / 1
+            ),
+        ];
+
+        for (name, side, post, want_outcome, want_r) in scenarios {
+            let mut bars = vec![bar(0, 100.0, 100.0, 100.0, 100.0)];
+            bars.extend(post);
+            let legacy = tb.label_one(&bars, 0, side, atr).unwrap();
+            let explicit = tb.label_one_with_risk(&bars, 0, side, atr, &rm).unwrap();
+
+            // The scenario genuinely produces the intended outcome (so the sweep isn't vacuous).
+            assert_eq!(legacy.outcome, want_outcome, "scenario {name}: outcome");
+            assert!(
+                (legacy.ret_r - want_r).abs() < 1e-9,
+                "scenario {name}: ret_r={}",
+                legacy.ret_r
+            );
+            // ...and the legacy path matches from_profile on EVERY field (entry_ts, t1, side,
+            // entry_px, target_px, stop_px, outcome, ret_r — LabelEvent derives PartialEq).
+            assert_eq!(legacy, explicit, "scenario {name}: legacy != from_profile");
+        }
     }
 
     #[test]

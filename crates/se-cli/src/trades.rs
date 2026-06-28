@@ -182,9 +182,17 @@ pub async fn run(
 
     // Honesty: the record above is IN-SAMPLE (the raw backtest, memorization-prone).
     // Contrast it with the purged OOS expectancy — the edge the engine actually trusts.
+    // Use the LATEST score per strategy (as persist.rs / the API / the monitor all do), not a
+    // flat avg over every historical row — re-evaluation appends rows, so a flat avg would mix in
+    // superseded scores and weight strategies by their evaluation count.
     let oos_exp: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
-        "SELECT avg(o.oos_expectancy_cost_aware) FROM oos_scores o \
-         JOIN strategies s ON s.strategy_id = o.strategy_id \
+        "SELECT avg(latest.oos_expectancy_cost_aware) \
+         FROM strategies s \
+         JOIN LATERAL ( \
+             SELECT oos_expectancy_cost_aware FROM oos_scores \
+             WHERE strategy_id = s.strategy_id \
+             ORDER BY evaluated_at DESC LIMIT 1 \
+         ) latest ON TRUE \
          WHERE s.status = 'promoted' AND s.horizon = $1",
     )
     .bind(profile.horizon.as_str())
@@ -196,10 +204,12 @@ pub async fn run(
     println!("\n⚠ the above is the IN-SAMPLE backtest (memorization-prone).");
     if let Some(oos) = oos_exp {
         println!(
-            "  OOS-VALIDATED expectancy (purged CPCV — the edge the engine trusts): {oos:+.3} R",
+            "  OOS-VALIDATED expectancy (purged CPCV, latest per strategy — the edge the engine trusts): {oos:+.3} R",
         );
+        // The in-sample figure is GROSS R; the OOS figure is cost-aware (net). So the gap is
+        // overfit decay PLUS the round-trip cost wedge — both already discounted by the gate.
         println!(
-            "  the gap (in-sample {avg_r:+.3}R → OOS {oos:+.3}R) IS the overfit the gate already discounted."
+            "  the gap (in-sample {avg_r:+.3}R gross → OOS {oos:+.3}R cost-aware) is overfit decay + the cost wedge the gate already discounts."
         );
     }
     println!("→ journaled as mode=backtest; view on the dashboard Journal page.");
