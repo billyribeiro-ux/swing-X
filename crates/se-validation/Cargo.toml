@@ -11,7 +11,7 @@ se-core = { path = "../se-core" }
 se-mlclient = { path = "../se-mlclient" }
 se-labeler = { path = "../se-labeler" }
 serde = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-chrono = { workspace = true }

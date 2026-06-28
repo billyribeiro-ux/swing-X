@@ -6,6 +6,7 @@
 //! `inject-leak-test` (P4) and `promote --dry-run` (P5).
 
 mod ingest;
+mod leak_test;
 mod sanity;
 
 use std::collections::HashMap;
@@ -88,9 +89,7 @@ async fn main() -> Result<()> {
             println!("✓ migrations applied");
         }
         Cmd::Scan(args) => scan(&cfg, args).await?,
-        Cmd::InjectLeakTest => {
-            println!("inject-leak-test is implemented in phase P4 (validation harness).");
-        }
+        Cmd::InjectLeakTest => leak_test::run().await?,
         Cmd::RegimeSanityCheck => {
             let store = Store::connect(&cfg.database_url)
                 .await

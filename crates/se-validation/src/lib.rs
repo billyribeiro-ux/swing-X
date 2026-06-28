@@ -12,6 +12,7 @@
 //! end-to-end against the live worker: a leaky (look-ahead) dataset is REJECTED while a
 //! genuine-edge dataset PASSES.
 
+pub mod fixtures;
 pub mod gate;
 pub mod harness;
 
