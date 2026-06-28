@@ -97,6 +97,9 @@ struct PromoteArgs {
     generations: u32,
     #[arg(long, default_value_t = 12)]
     per_gen: usize,
+    /// Provider hint (accepted for parity with `search`/`scan`; reads from the store).
+    #[arg(long)]
+    provider: Option<String>,
     #[arg(long)]
     horizon: Option<String>,
     #[arg(long)]
