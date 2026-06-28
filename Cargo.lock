@@ -1786,6 +1786,7 @@ dependencies = [
  "se-core",
  "se-features",
  "se-provider",
+ "se-regime",
  "se-store",
  "serde_json",
  "tokio",
@@ -1884,7 +1885,15 @@ dependencies = [
 name = "se-regime"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "se-core",
+ "se-features",
+ "se-provider",
+ "se-store",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -167,7 +167,7 @@ impl RegimeClassifier {
         if core < cfg.min_core_inputs {
             return ood(observed);
         }
-        if let Some(_reason) = self.out_of_bounds(f) {
+        if self.out_of_bounds(f).is_some() {
             return ood(observed);
         }
 

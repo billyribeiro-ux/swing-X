@@ -121,6 +121,31 @@ impl<'a> PitContext<'a> {
         Ok(self.bars(cadence, 1).await?.into_iter().next_back())
     }
 
+    /// Same as [`bars`](Self::bars) but for a DIFFERENT `ticker` than the one this
+    /// context is bound to — needed for cross-ticker features (relative strength
+    /// vs SPY, universe breadth). The leakage predicate is identical: only bars
+    /// with `ts <= cutoff AND as_of <= cutoff` are returned, where `cutoff` is
+    /// this context's `decision_ts`. Chronological (oldest-first) order.
+    pub async fn bars_for(&self, other: Ticker, cadence: &str, lookback: i64) -> Result<Vec<Bar>> {
+        let rows: Vec<BarRow> = sqlx::query_as::<_, BarRow>(
+            "SELECT ticker, ts, open, high, low, close, volume \
+             FROM bars \
+             WHERE ticker = $1 AND cadence = $2 \
+               AND ts <= $3 AND as_of <= $3 \
+             ORDER BY ts DESC \
+             LIMIT $4",
+        )
+        .bind(other.as_str())
+        .bind(cadence)
+        .bind(self.cutoff())
+        .bind(lookback.max(0))
+        .fetch_all(self.pool)
+        .await
+        .map_err(store_err)?;
+
+        Ok(rows.iter().rev().filter_map(|r| r.to_bar()).collect())
+    }
+
     // ---- macro (market-wide) PIT reads -----------------------------------
     //
     // The macro store is NOT per-ticker: these methods ignore `self.ticker` and
