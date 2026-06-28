@@ -1,13 +1,17 @@
 //! `se` — the swing-X operator CLI.
 //!
-//! P1 commands: `migrate` and `scan` (ingest a window + run the Layer-0
-//! tradeability gate, showing scores and rejects-with-reasons). Later phases add
-//! `inject-leak-test` (P4), `regime-sanity-check` (P2), `promote --dry-run` (P5).
+//! P1 commands: `migrate` and `scan` (ingest a window + macro + run the Layer-0
+//! tradeability gate and Layer-1 regime labeling). P2 adds `regime-sanity-check`
+//! (cross-check regime labels against known historical events). Later phases add
+//! `inject-leak-test` (P4) and `promote --dry-run` (P5).
+
+mod ingest;
+mod sanity;
 
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
 use clap::{Args, Parser, Subcommand};
 
 use se_config::AppConfig;
@@ -16,8 +20,16 @@ use se_features::indicators::{dollar_adv, realized_vol};
 use se_features::{
     FeatureContext, FeatureModule, TradeabilityGate, TradeabilityInput, TradeabilityModule,
 };
-use se_provider::{DataProvider, FmpProvider, MockProvider, NullProprietary, ProviderKind};
+use se_provider::{
+    DataProvider, FmpProvider, FredProvider, MockProvider, NullProprietary, ProviderKind,
+};
+use se_regime::RegimeEngine;
 use se_store::{FeatureWrite, Store};
+
+/// Session-close UTC timestamp convention shared across the repo (21:00 UTC).
+pub(crate) fn session_close(date: NaiveDate) -> DateTime<Utc> {
+    Utc.from_utc_datetime(&date.and_hms_opt(21, 0, 0).expect("21:00:00 valid"))
+}
 
 #[derive(Parser)]
 #[command(
@@ -79,7 +91,11 @@ async fn main() -> Result<()> {
             println!("inject-leak-test is implemented in phase P4 (validation harness).");
         }
         Cmd::RegimeSanityCheck => {
-            println!("regime-sanity-check is implemented in phase P2 (regime layer).");
+            let store = Store::connect(&cfg.database_url)
+                .await
+                .context("connect db")?;
+            store.migrate().await.context("migrate")?;
+            sanity::run(&store, &[Ticker::Spy, Ticker::Qqq]).await?;
         }
     }
     Ok(())
@@ -131,9 +147,11 @@ async fn scan(cfg: &AppConfig, args: ScanArgs) -> Result<()> {
         Some(s) => parse_date(&s)?,
         None => last_weekday(Utc::now().date_naive()),
     };
+    // Default to ~24 months so there's enough history to compute regime
+    // percentiles/trends and to label a meaningful window.
     let from = match args.from {
         Some(s) => parse_date(&s)?,
-        None => to - Duration::days(120),
+        None => to - Duration::days(730),
     };
 
     let store = Store::connect(&cfg.database_url)
@@ -197,9 +215,50 @@ async fn scan(cfg: &AppConfig, args: ScanArgs) -> Result<()> {
         }
     }
     println!(
-        "ingested {total_bars} bar-rows across {} names\n",
+        "ingested {total_bars} bar-rows across {} names",
         latest.len()
     );
+
+    // ---- macro ingest (market-wide, once per run) ------------------------
+    // Pull every MacroSeries from its preferred provider (FMP or FRED). Only the
+    // live HTTP providers serve real macro; the mock provider serves synthetic
+    // macro so offline runs still populate the regime store.
+    let macro_report = match provider.kind() {
+        ProviderKind::Fmp => {
+            let fmp = FmpProvider::from_env().context("init FMP provider for macro")?;
+            let fred = FredProvider::from_env();
+            ingest::ingest_macro(&store, Some(&fmp), Some(&fred), from, to).await?
+        }
+        _ => {
+            // Mock (or other) provider: ingest macro through the same DataProvider
+            // so the regime layer has inputs offline.
+            ingest::ingest_macro_via(&store, provider.as_ref(), from, to).await?
+        }
+    };
+    println!("{}\n", macro_report.summary_line());
+
+    // ---- regime labeling at the latest bar (Layer-1) ---------------------
+    let regime_engine = RegimeEngine::default();
+    let mut regime_line = String::new();
+    for &t in &cfg.universe {
+        let Some(&last_ts) = latest.get(&t) else {
+            continue;
+        };
+        if let Some(a) = regime_engine
+            .assess_at(&store, t, DecisionTs::new(last_ts))
+            .await?
+        {
+            regime_line.push_str(&format!(
+                "{}={}({:.0}%)  ",
+                t.as_str(),
+                a.label.as_str(),
+                a.confidence * 100.0
+            ));
+        }
+    }
+    if !regime_line.is_empty() {
+        println!("regime @ latest bar: {}\n", regime_line.trim_end());
+    }
 
     // ---- tradeability gate (real pipeline: PIT -> feature module -> store) --
     let gate = TradeabilityGate::default();

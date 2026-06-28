@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use crate::error::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegimeLabel {
     /// Dealers net short gamma → trend / continuation.

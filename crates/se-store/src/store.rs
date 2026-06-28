@@ -7,7 +7,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::QueryBuilder;
 use uuid::Uuid;
 
-use crate::models::FeatureWrite;
+use crate::models::{FeatureWrite, MacroWrite};
 use crate::pit::PitContext;
 
 fn store_err(e: impl std::fmt::Display) -> Error {
@@ -136,6 +136,47 @@ impl Store {
             total += res.rows_affected();
         }
         Ok(total)
+    }
+
+    /// Upsert a batch of market-wide macro observations (idempotent on the
+    /// bitemporal key `(series, ts, as_of)`). Preserves every vintage so a
+    /// PIT read at decision bar T can filter `ts <= T AND as_of <= T`.
+    pub async fn upsert_macro(&self, points: &[MacroWrite]) -> Result<u64> {
+        if points.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0u64;
+        // 6 columns/row; chunk well under the ~65535 Postgres parameter limit.
+        for chunk in points.chunks(5000) {
+            let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+                "INSERT INTO macro_series_pit (series, ts, as_of, value, lead_time, source) ",
+            );
+            qb.push_values(chunk, |mut b, p| {
+                b.push_bind(p.series.as_str())
+                    .push_bind(p.ts)
+                    .push_bind(p.as_of)
+                    .push_bind(p.value)
+                    .push_bind(p.lead_time.to_tag_string())
+                    .push_bind(p.source.as_str());
+            });
+            qb.push(
+                " ON CONFLICT (series, ts, as_of) DO UPDATE SET \
+                 value = EXCLUDED.value, lead_time = EXCLUDED.lead_time, source = EXCLUDED.source",
+            );
+            let res = qb.build().execute(&self.pool).await.map_err(store_err)?;
+            total += res.rows_affected();
+        }
+        Ok(total)
+    }
+
+    /// Delete macro rows by provenance source (used to clean up test data).
+    pub async fn delete_macro_by_source(&self, source: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM macro_series_pit WHERE source = $1")
+            .bind(source)
+            .execute(&self.pool)
+            .await
+            .map_err(store_err)?;
+        Ok(res.rows_affected())
     }
 
     /// Persist a regime assignment.

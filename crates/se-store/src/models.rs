@@ -3,6 +3,21 @@
 use chrono::{DateTime, Utc};
 use se_core::{AsOf, Bar, DecisionTs, Feature, Layer, LeadTimeTag, Ticker};
 
+/// A market-wide macro/cross-asset/vol observation to persist into the PIT macro
+/// store, with full provenance. Not per-ticker — keyed by `(series, ts, as_of)`.
+#[derive(Debug, Clone)]
+pub struct MacroWrite {
+    /// Stable series key, e.g. `vix`, `ust10y`, `hy_oas` (matches `MacroSeries::as_str`).
+    pub series: String,
+    /// Reference date of the observation (event time).
+    pub ts: DateTime<Utc>,
+    /// When the value became knowable (knowledge time). For lagged series, later than `ts`.
+    pub as_of: DateTime<Utc>,
+    pub value: f64,
+    pub lead_time: LeadTimeTag,
+    pub source: String,
+}
+
 /// A bar row as stored. `cadence` distinguishes daily vs intraday series.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BarRow {
@@ -85,4 +100,11 @@ impl FeatureRow {
             source: self.source.clone(),
         })
     }
+}
+
+/// Internal read row for the PIT macro history query.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct MacroHistoryRow {
+    pub ts: DateTime<Utc>,
+    pub value: f64,
 }

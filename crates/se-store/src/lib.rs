@@ -14,7 +14,7 @@ mod models;
 mod pit;
 mod store;
 
-pub use models::{BarRow, FeatureWrite};
+pub use models::{BarRow, FeatureWrite, MacroWrite};
 pub use pit::PitContext;
 pub use store::Store;
 

@@ -16,6 +16,7 @@ se-config = { path = "../se-config" }
 se-store = { path = "../se-store" }
 se-provider = { path = "../se-provider" }
 se-features = { path = "../se-features" }
+se-regime = { path = "../se-regime" }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

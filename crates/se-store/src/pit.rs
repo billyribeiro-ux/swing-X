@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use se_core::{Bar, DecisionTs, Error, Feature, Layer, Result, Ticker};
 use sqlx::postgres::PgPool;
 
-use crate::models::{BarRow, FeatureRow};
+use crate::models::{BarRow, FeatureRow, MacroHistoryRow};
 
 fn store_err(e: impl std::fmt::Display) -> Error {
     Error::Store(e.to_string())
@@ -119,5 +119,59 @@ impl<'a> PitContext<'a> {
     /// The single most recent observable bar.
     pub async fn latest_bar(&self, cadence: &str) -> Result<Option<Bar>> {
         Ok(self.bars(cadence, 1).await?.into_iter().next_back())
+    }
+
+    // ---- macro (market-wide) PIT reads -----------------------------------
+    //
+    // The macro store is NOT per-ticker: these methods ignore `self.ticker` and
+    // use only `self.decision_ts` as the cutoff. The leakage predicate is the
+    // same as for features/bars — a value is visible only when its reference date
+    // AND its knowledge time are both on or before the decision bar:
+    //   `ts <= cutoff AND as_of <= cutoff`.
+
+    /// Latest value of a macro `series` knowable at the decision bar — the most
+    /// recent observation with `ts <= cutoff AND as_of <= cutoff`, picking the
+    /// newest vintage (`as_of`) when several exist for the same `ts`.
+    pub async fn macro_value_as_of(&self, series: &str) -> Result<Option<f64>> {
+        let row: Option<(f64,)> = sqlx::query_as(
+            "SELECT value \
+             FROM macro_series_pit \
+             WHERE series = $1 AND ts <= $2 AND as_of <= $2 \
+             ORDER BY ts DESC, as_of DESC \
+             LIMIT 1",
+        )
+        .bind(series)
+        .bind(self.cutoff())
+        .fetch_optional(self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Chronological (oldest-first) history of a macro `series`: the latest
+    /// knowable value per reference date `ts`, for the most recent `lookback`
+    /// dates with `ts <= cutoff AND as_of <= cutoff`.
+    pub async fn macro_history(
+        &self,
+        series: &str,
+        lookback: i64,
+    ) -> Result<Vec<(DateTime<Utc>, f64)>> {
+        let rows: Vec<MacroHistoryRow> = sqlx::query_as::<_, MacroHistoryRow>(
+            "SELECT ts, value FROM ( \
+                 SELECT DISTINCT ON (ts) ts, value \
+                 FROM macro_series_pit \
+                 WHERE series = $1 AND ts <= $2 AND as_of <= $2 \
+                 ORDER BY ts DESC, as_of DESC \
+                 LIMIT $3 \
+             ) sub \
+             ORDER BY ts ASC",
+        )
+        .bind(series)
+        .bind(self.cutoff())
+        .bind(lookback.max(0))
+        .fetch_all(self.pool)
+        .await
+        .map_err(store_err)?;
+        Ok(rows.into_iter().map(|r| (r.ts, r.value)).collect())
     }
 }

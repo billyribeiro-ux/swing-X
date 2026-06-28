@@ -10,10 +10,12 @@
 
 pub mod indicators;
 mod layer0_tradeability;
+mod layer1_regime;
 mod module;
 
 pub use layer0_tradeability::{
     TradeabilityComponents, TradeabilityConfig, TradeabilityGate, TradeabilityInput,
     TradeabilityModule, TradeabilityScore,
 };
+pub use layer1_regime::RegimeModule;
 pub use module::{FeatureContext, FeatureModule};
