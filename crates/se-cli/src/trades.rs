@@ -166,7 +166,30 @@ pub async fn run(
     println!("  avg trade:   {avg_r:+.3} R");
     println!("  profit factor: {pf:.2}   (gross wins {gross_win:.1}R / gross losses {gross_loss:.1}R)");
     println!("  expectancy:  {avg_r:+.3} R/trade");
-    println!("\n→ journaled as mode=backtest; view on the dashboard Journal page.");
+
+    // Honesty: the record above is IN-SAMPLE (the raw backtest, memorization-prone).
+    // Contrast it with the purged OOS expectancy — the edge the engine actually trusts.
+    let oos_exp: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT avg(o.oos_expectancy_cost_aware) FROM oos_scores o \
+         JOIN strategies s ON s.strategy_id = o.strategy_id \
+         WHERE s.status = 'promoted' AND s.horizon = $1",
+    )
+    .bind(profile.horizon.as_str())
+    .fetch_one(store.pool())
+    .await
+    .ok()
+    .flatten();
+
+    println!("\n⚠ the above is the IN-SAMPLE backtest (memorization-prone).");
+    if let Some(oos) = oos_exp {
+        println!(
+            "  OOS-VALIDATED expectancy (purged CPCV — the edge the engine trusts): {oos:+.3} R",
+        );
+        println!(
+            "  the gap (in-sample {avg_r:+.3}R → OOS {oos:+.3}R) IS the overfit the gate already discounted."
+        );
+    }
+    println!("→ journaled as mode=backtest; view on the dashboard Journal page.");
     println!("(win rate is descriptive only — the engine ranks on expectancy/PF/CVaR, never win rate.)");
 
     Ok(())
