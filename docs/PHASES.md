@@ -7,13 +7,15 @@ Status legend: ✅ done · 🚧 in progress · ⬜ pending
 | P0 | Monorepo scaffold, toolchain, PIT schema, DB up | ✅ |
 | P1 | PIT store + daily ingest + tradeability gate | ✅ |
 | P2 | Regime layer + classifier (label 24mo, sanity-check vs events) | ✅ |
-| P3 | Location + trigger layers + triple-barrier labeler → first signals | 🚧 |
-| P4 | Validation harness (CPCV/DSR/PBO) + cost model | 🚧 |
-| P5 | Search + mutation loop wired to OOS scoreboard | ⬜ |
-| P6 | Forward-adaptation monitor on live/paper | ⬜ |
-| P7 | Signal output + paper-trade journal + API + dashboard | ⬜ |
-| P8 | Horizon generalization (short_swing/day/0dte/scalp) | ⬜ |
+| P3 | Location + trigger layers + triple-barrier labeler → first signals | ✅ |
+| P4 | Validation harness (CPCV/DSR/PBO) + cost model | ✅ |
+| P5 | Search + mutation loop wired to OOS scoreboard | ✅ |
+| P6 | Forward-adaptation monitor on live/paper | ✅ |
+| P7 | Signal output + paper-trade journal + API + dashboard | ✅ |
+| P8 | Horizon generalization (short_swing/day/0dte/scalp) | ✅ |
 
+Nightly loop: `se nightly` (orchestrated by `se-orchestrator`'s job graph) runs
+ingest → search → signals → journal → monitor → changelog.
 Parallel tracks: SvelteKit dashboard (`apps/web`) and Python ML worker (`ml-worker`)
 are built alongside the backend phases.
 
@@ -37,4 +39,18 @@ are built alongside the backend phases.
 - ML worker (`ml-worker`): 45 tests; **leakage checkpoint proven at the Python level** — a planted
   look-ahead feature scores ~0.99 in-sample but collapses OOS → DSR=0 → gate rejects; genuine edge
   passes (DSR=1.0, PBO=0); noise rejected.
-- Dashboard (`apps/web`): svelte-check 0/0 (strict TS), build + 19 unit + 1 e2e green.
+- P4: **leakage checkpoint proven at all three levels** — Python fixtures, the Rust `se-validation`
+  integration test (live, through HTTP), and the operator command `se inject-leak-test` (LEAKY →
+  REJECT on OOS expectancy −0.12 / 1 regime; GENUINE → PASS DSR 1.0, PBO 0.047, 3 regimes).
+- P5: `se search` materializes a 38-feature catalog over 10 windows, ranks ONLY on OOS, and the
+  promotion gate correctly withholds a +0.81R / DSR 0.95 / PF 3.58 genome that proved out in just
+  1 regime (gate needs ≥2) — promotions require multi-regime history (the nightly batch).
+- P6: monitor 11 tests; detectors map metric→threshold→action (shrink/quarantine/disable/recalibrate/
+  suppress) and never keep trading something broken.
+- P7: `se-api` serves camelCase DTOs (no winRate) + WS push; dashboard fetches live when PUBLIC_API_BASE
+  is set, falls back to fixtures otherwise.
+- P8: the whole pipeline is `HorizonProfile`-parameterized (SE_HORIZON / --horizon); `se-search`'s
+  p8_horizon test runs ≥2 profiles end-to-end with no hardcoded swing constants.
+- Dashboard (`apps/web`): svelte-check 0/0 (strict TS), build + 23 unit + 1 e2e green.
+- Whole workspace: clippy `-D warnings` clean; all crate tests green; `se nightly` runs the
+  ingest→search→signals→journal→monitor→changelog loop.
