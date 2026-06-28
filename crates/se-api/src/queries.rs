@@ -31,7 +31,9 @@ fn drivers_from_json(v: &serde_json::Value) -> Vec<DriverDto> {
             arr.iter()
                 .filter_map(|d| {
                     Some(DriverDto {
-                        layer: d.get("layer")?.as_str()?.to_string(),
+                        // Normalize to the lowercase layer contract (older rows stored
+                        // PascalCase via serde before Layer adopted snake_case).
+                        layer: d.get("layer")?.as_str()?.to_ascii_lowercase(),
                         key: d.get("key")?.as_str()?.to_string(),
                         contribution: d
                             .get("contribution")

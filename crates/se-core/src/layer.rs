@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::error::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Layer {
     /// L0 — only scan names with a large hand leaning on them.
     Tradeability,
