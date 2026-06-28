@@ -100,9 +100,34 @@ pub const DEFAULT_EQUITY_SEED: &[&str] = &[
     "PEP", "ADBE", "INTC", "CSCO", "QCOM", "TXN", "AMAT", "MU",
 ];
 
-/// Resolve the equity scanner's universe from `SE_EQUITY_UNIVERSE` (comma/space-separated
-/// symbols), falling back to [`DEFAULT_EQUITY_SEED`]. Invalid symbols are rejected loudly.
+/// Resolve the equity scanner's universe. Precedence:
+///   1. `SE_EQUITY_UNIVERSE_FILE` — a path to a file of symbols (comma/whitespace/newline
+///      separated). This is how the FULL ~6k US-equity universe is supplied: `se fetch-universe`
+///      writes the live FMP list to a file and points this at it. Unparseable symbols are skipped
+///      (a 6k-symbol list will contain a few odd tickers we don't want to hard-fail on).
+///   2. `SE_EQUITY_UNIVERSE` — an inline comma/space-separated list (for small explicit sets).
+///   3. [`DEFAULT_EQUITY_SEED`] — a liquid large-cap seed so the scanner always has something.
 fn resolve_equity_universe() -> Result<Vec<Ticker>> {
+    // 1. File of symbols (the full-universe path).
+    if let Ok(path) = std::env::var("SE_EQUITY_UNIVERSE_FILE") {
+        if !path.trim().is_empty() {
+            let body = std::fs::read_to_string(path.trim())
+                .map_err(|e| Error::Config(format!("read SE_EQUITY_UNIVERSE_FILE: {e}")))?;
+            let out: Vec<Ticker> = body
+                .split([',', ' ', '\n', '\t', '\r'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<Ticker>().ok()) // skip odd symbols in a big list
+                .collect();
+            if out.is_empty() {
+                return Err(Error::Config(
+                    "equity universe file had no valid symbols".into(),
+                ));
+            }
+            return Ok(cap_universe(dedup_keep_order(out)));
+        }
+    }
+    // 2. Inline list, else 3. the seed.
     let raw = std::env::var("SE_EQUITY_UNIVERSE").unwrap_or_default();
     let syms: Vec<&str> = if raw.trim().is_empty() {
         DEFAULT_EQUITY_SEED.to_vec()
@@ -119,7 +144,28 @@ fn resolve_equity_universe() -> Result<Vec<Ticker>> {
                 .map_err(|e| Error::Config(e.to_string()))?,
         );
     }
-    Ok(out)
+    Ok(dedup_keep_order(out))
+}
+
+/// Drop duplicate tickers while preserving first-seen order (the universe file is liquidity-ranked,
+/// so order is meaningful — most-liquid names get scanned first).
+fn dedup_keep_order(v: Vec<Ticker>) -> Vec<Ticker> {
+    let mut seen = std::collections::HashSet::new();
+    v.into_iter().filter(|t| seen.insert(*t)).collect()
+}
+
+/// Optionally cap the equity universe to the first `SE_EQUITY_MAX` symbols. Because the universe
+/// file is liquidity-ranked, this scans the most-liquid `N` first — the operator's explicit knob
+/// for per-run batch size (the full ~6k universe completes across repeated nightly runs). Unset =
+/// no cap (the whole universe).
+fn cap_universe(v: Vec<Ticker>) -> Vec<Ticker> {
+    match std::env::var("SE_EQUITY_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        Some(n) if n > 0 && n < v.len() => v.into_iter().take(n).collect(),
+        _ => v,
+    }
 }
 
 /// Resolve the operator's ground-rule [`RiskModel`] from `SE_STOP`/`SE_TARGET1`/`SE_TARGET2`,
