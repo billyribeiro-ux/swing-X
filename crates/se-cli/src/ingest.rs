@@ -34,6 +34,50 @@ impl MacroIngestReport {
     }
 }
 
+/// Pull the earnings calendar over `[from, to]` for the universe and upsert it into the
+/// `earnings` table (the equity scanner's blackout source). Filters to the active universe so the
+/// table stays scoped to what we scan. Returns the number of rows stored. Best-effort: a provider
+/// that can't supply earnings (mock returns synthetic; FRED/proprietary return empty) just stores
+/// nothing rather than failing the run.
+pub async fn ingest_earnings(
+    store: &Store,
+    provider: &dyn DataProvider,
+    universe: &[Ticker],
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<u64> {
+    let events = provider
+        .earnings_calendar(from, to)
+        .await
+        .context("fetch earnings calendar")?;
+    let in_universe: std::collections::HashSet<&str> =
+        universe.iter().map(|t| t.as_str()).collect();
+    let source = match provider.kind() {
+        ProviderKind::Fmp => "fmp",
+        ProviderKind::Mock => "mock",
+        ProviderKind::Fred => "fred",
+        ProviderKind::Proprietary => "proprietary",
+    };
+    let mut stored = 0u64;
+    for ev in &events {
+        if !in_universe.contains(ev.ticker.as_str()) {
+            continue;
+        }
+        se_store::sqlx::query(
+            "INSERT INTO earnings (ticker, date, source) VALUES ($1, $2, $3) \
+             ON CONFLICT (ticker, date) DO NOTHING",
+        )
+        .bind(ev.ticker.as_str())
+        .bind(ev.date)
+        .bind(source)
+        .execute(store.pool())
+        .await
+        .map_err(|e| anyhow::anyhow!("insert earnings: {e}"))?;
+        stored += 1;
+    }
+    Ok(stored)
+}
+
 fn map_point(p: &MacroPoint) -> MacroWrite {
     MacroWrite {
         series: p.series.as_str().to_string(),

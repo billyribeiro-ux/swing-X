@@ -40,6 +40,8 @@ pub enum NoSignal {
     NoAtr,
     NoOosScore,
     GeometryRefused(String),
+    /// An earnings release falls inside the would-be holding window (single-name gap risk).
+    EarningsBlackout(chrono::NaiveDate),
 }
 
 impl std::fmt::Display for NoSignal {
@@ -51,8 +53,38 @@ impl std::fmt::Display for NoSignal {
             NoSignal::NoAtr => write!(f, "insufficient history for ATR"),
             NoSignal::NoOosScore => write!(f, "no persisted OOS score for the strategy"),
             NoSignal::GeometryRefused(why) => write!(f, "signal refused: {why}"),
+            NoSignal::EarningsBlackout(d) => {
+                write!(f, "earnings blackout (release {d} inside holding window)")
+            }
         }
     }
+}
+
+/// Is there an earnings release inside the would-be holding window? Returns the offending date if
+/// so. The window is the horizon's max holding period converted from trading bars to calendar days
+/// (`bars × 7 ÷ 5`, ceil). ETFs have no earnings rows, so this is a no-op for the ETF scanner.
+async fn earnings_in_holding_window(
+    store: &Store,
+    ticker: Ticker,
+    decision_ts: DateTime<Utc>,
+    profile: &HorizonProfile,
+) -> Result<Option<chrono::NaiveDate>> {
+    let decision_date = decision_ts.date_naive();
+    // Trading bars -> calendar days (ceil of bars × 7/5), at least 1.
+    let blackout_days = ((profile.max_hold_bars as i64 * 7) + 4) / 5;
+    let blackout_days = blackout_days.max(1);
+    let until = decision_date + chrono::Duration::days(blackout_days);
+    let row: Option<(chrono::NaiveDate,)> = se_store::sqlx::query_as(
+        "SELECT date FROM earnings WHERE ticker = $1 AND date > $2 AND date <= $3 \
+         ORDER BY date ASC LIMIT 1",
+    )
+    .bind(ticker.as_str())
+    .bind(decision_date)
+    .bind(until)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|e| se_core::Error::Store(e.to_string()))?;
+    Ok(row.map(|(d,)| d))
 }
 
 /// The outcome of attempting to build a signal for one strategy at one ticker.
@@ -164,6 +196,12 @@ pub async fn build_signal_for(
     let assessment = RegimeClassifier::default().classify(&features);
     if !assessment.label.is_tradeable() {
         return Ok(SignalAttempt::Skipped(NoSignal::RegimeNotTradeable));
+    }
+
+    // Earnings blackout: never open a new position into a release inside the holding window
+    // (single-name gap risk that the stop can't honor). No-op for ETFs (no earnings rows).
+    if let Some(d) = earnings_in_holding_window(store, ticker, bar.ts, profile).await? {
+        return Ok(SignalAttempt::Skipped(NoSignal::EarningsBlackout(d)));
     }
 
     let Some(atr_val) = atr_opt else {
