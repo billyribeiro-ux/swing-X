@@ -2,7 +2,7 @@
 //! `oos_scores` tables (se-store is off-limits, so we use its public `pool()` + re-exported
 //! `sqlx`). No schema changes; only inserts/updates of columns defined in `0001_init.sql`.
 
-use se_core::{Genome, Result, Strategy, StrategyId, StrategyStatus};
+use se_core::{Genome, Result, Scanner, Strategy, StrategyId, StrategyStatus};
 use se_store::Store;
 
 use crate::score::OosScore;
@@ -11,12 +11,13 @@ fn store_err(e: impl std::fmt::Display) -> se_core::Error {
     se_core::Error::Store(e.to_string())
 }
 
-/// Insert (or update) a strategy row: genome jsonb, status, generation, parent.
-pub async fn upsert_strategy(store: &Store, strategy: &Strategy) -> Result<()> {
+/// Insert (or update) a strategy row: genome jsonb, status, generation, parent, scanner.
+pub async fn upsert_strategy(store: &Store, strategy: &Strategy, scanner: Scanner) -> Result<()> {
     let genome_json = serde_json::to_value(&strategy.genome).map_err(store_err)?;
     se_store::sqlx::query(
-        "INSERT INTO strategies (strategy_id, horizon, genome, parent_id, status, generation) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO strategies \
+            (strategy_id, horizon, genome, parent_id, status, generation, scanner) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (strategy_id) DO UPDATE SET \
              genome = EXCLUDED.genome, status = EXCLUDED.status, \
              generation = EXCLUDED.generation, parent_id = EXCLUDED.parent_id, \
@@ -28,6 +29,7 @@ pub async fn upsert_strategy(store: &Store, strategy: &Strategy) -> Result<()> {
     .bind(strategy.parent.map(|p| p.inner()))
     .bind(strategy.status.as_str())
     .bind(strategy.generation as i32)
+    .bind(scanner.as_str())
     .execute(store.pool())
     .await
     .map_err(store_err)?;
@@ -101,14 +103,19 @@ pub async fn load_strategy(store: &Store, id: StrategyId) -> Result<Option<Strat
     }))
 }
 
-/// All promoted strategies (for signal generation), newest first.
-pub async fn load_promoted(store: &Store, horizon: &str) -> Result<Vec<Strategy>> {
+/// All promoted strategies for a (horizon, scanner), newest first — used for signal generation.
+pub async fn load_promoted(
+    store: &Store,
+    horizon: &str,
+    scanner: Scanner,
+) -> Result<Vec<Strategy>> {
     let rows: Vec<(uuid::Uuid, serde_json::Value, i32, Option<uuid::Uuid>)> =
         se_store::sqlx::query_as(
             "SELECT strategy_id, genome, generation, parent_id FROM strategies \
-         WHERE status = 'promoted' AND horizon = $1 ORDER BY updated_at DESC",
+         WHERE status = 'promoted' AND horizon = $1 AND scanner = $2 ORDER BY updated_at DESC",
         )
         .bind(horizon)
+        .bind(scanner.as_str())
         .fetch_all(store.pool())
         .await
         .map_err(store_err)?;

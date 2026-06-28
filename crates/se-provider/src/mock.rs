@@ -9,7 +9,18 @@ use chrono::{Datelike, NaiveDate, TimeZone, Utc, Weekday};
 use se_core::{Bar, LeadTimeTag, Result, Ticker};
 
 use crate::provider::DataProvider;
-use crate::types::{Capabilities, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote};
+use crate::types::{
+    Capabilities, EarningsEvent, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote,
+};
+
+/// The deterministic mock equity universe: liquid US large-cap common stocks, in a
+/// fixed canonical order. `equity_universe(max)` returns a prefix of this list, and
+/// `earnings_calendar` synthesizes one event per name — so the equity scanner and
+/// its earnings-blackout guard are fully testable offline.
+const MOCK_EQUITY_UNIVERSE: [&str; 20] = [
+    "TSLA", "AAPL", "META", "NVDA", "AMZN", "GOOGL", "MSFT", "AMD", "NFLX", "CRM", "AVGO", "COST",
+    "PEP", "ADBE", "INTC", "CSCO", "QCOM", "TXN", "AMAT", "MU",
+];
 
 /// Hash a few integers into a stable u64 (splitmix64 finalizer over a fnv mix).
 fn hash_u64(seed: u64) -> u64 {
@@ -239,6 +250,71 @@ impl DataProvider for MockProvider {
             top_sector_weight: Some(if ticker.is_broad_index() { 0.30 } else { 0.95 }),
         }))
     }
+
+    async fn equity_universe(&self, max: usize) -> Result<Vec<Ticker>> {
+        // Deterministic fixed list, truncated to `max`. Every entry is a valid
+        // symbol, so `Ticker::new` never fails here.
+        Ok(MOCK_EQUITY_UNIVERSE
+            .iter()
+            .filter_map(|s| Ticker::new(s).ok())
+            .take(max)
+            .collect())
+    }
+
+    async fn earnings_calendar(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<EarningsEvent>> {
+        if from > to {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        // For each name, emit a stable, roughly-quarterly event: a per-symbol
+        // day-offset into each calendar quarter, kept inside [from, to]. The
+        // offset is derived from the symbol hash so the schedule is reproducible.
+        for sym in MOCK_EQUITY_UNIVERSE {
+            let Ok(ticker) = Ticker::new(sym) else {
+                continue;
+            };
+            // 0..=80 days into the quarter (every quarter spans >= 90 days).
+            let day_offset = (symbol_seed(ticker) % 81) as i64;
+            for q_start in quarter_starts(from, to) {
+                let event = q_start + chrono::Duration::days(day_offset);
+                if event >= from && event <= to {
+                    out.push(EarningsEvent {
+                        ticker,
+                        date: event,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| (a.date, a.ticker).cmp(&(b.date, b.ticker)));
+        Ok(out)
+    }
+}
+
+/// First day of every calendar quarter (Jan/Apr/Jul/Oct 1) whose quarter overlaps
+/// `[from, to]`. Starts one quarter before `from` so an event landing late in the
+/// prior quarter can still fall within the range.
+fn quarter_starts(from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
+    let mut out = Vec::new();
+    // Begin at the quarter start at or before `from`.
+    let first_q_month = ((from.month0() / 3) * 3) + 1; // 1, 4, 7, or 10
+    let mut cur =
+        NaiveDate::from_ymd_opt(from.year(), first_q_month, 1).expect("valid quarter start");
+    while cur <= to {
+        out.push(cur);
+        // Advance three months.
+        let mut y = cur.year();
+        let mut m = cur.month() + 3;
+        if m > 12 {
+            m -= 12;
+            y += 1;
+        }
+        cur = NaiveDate::from_ymd_opt(y, m, 1).expect("valid quarter start");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -260,5 +336,82 @@ mod tests {
             assert!(bar.low <= bar.open && bar.low <= bar.close);
             assert!(is_weekday(bar.ts.date_naive()));
         }
+    }
+
+    #[tokio::test]
+    async fn equity_universe_is_deterministic_and_truncates() {
+        let p = MockProvider;
+        let full = p.equity_universe(100).await.unwrap();
+        // The whole fixed list is returned when `max` exceeds it.
+        assert_eq!(full.len(), MOCK_EQUITY_UNIVERSE.len());
+        assert_eq!(full[0].as_str(), "TSLA");
+        assert_eq!(full[1].as_str(), "AAPL");
+        assert_eq!(full.last().unwrap().as_str(), "MU");
+
+        // Deterministic across calls.
+        let again = p.equity_universe(100).await.unwrap();
+        assert_eq!(full, again);
+
+        // Truncates to `max`, preserving order.
+        let five = p.equity_universe(5).await.unwrap();
+        assert_eq!(five, full[..5].to_vec());
+
+        // Zero is empty; none of them is a known v1 ETF.
+        assert!(p.equity_universe(0).await.unwrap().is_empty());
+        assert!(full.iter().all(|t| !t.is_etf()));
+    }
+
+    #[tokio::test]
+    async fn earnings_calendar_falls_within_range_and_is_deterministic() {
+        let p = MockProvider;
+        let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let events = p.earnings_calendar(from, to).await.unwrap();
+
+        assert!(
+            !events.is_empty(),
+            "should synthesize earnings in a full year"
+        );
+        // Every event is inside the range and references a universe symbol.
+        let universe: Vec<Ticker> = p.equity_universe(usize::MAX).await.unwrap();
+        for e in &events {
+            assert!(e.date >= from && e.date <= to, "{:?} out of range", e.date);
+            assert!(
+                universe.contains(&e.ticker),
+                "{:?} not in universe",
+                e.ticker
+            );
+        }
+        // Sorted ascending by (date, ticker).
+        let mut sorted = events.clone();
+        sorted.sort_by(|a, b| (a.date, a.ticker).cmp(&(b.date, b.ticker)));
+        assert_eq!(events, sorted);
+
+        // Roughly quarterly: across a full year each name reports ~4 times.
+        let aapl = Ticker::new("AAPL").unwrap();
+        let aapl_events = events.iter().filter(|e| e.ticker == aapl).count();
+        assert!(
+            (3..=5).contains(&aapl_events),
+            "expected ~quarterly cadence, got {aapl_events}"
+        );
+
+        // Deterministic across calls.
+        let again = p.earnings_calendar(from, to).await.unwrap();
+        assert_eq!(events, again);
+    }
+
+    #[tokio::test]
+    async fn earnings_calendar_respects_a_narrow_window() {
+        let p = MockProvider;
+        // A single day: at most one event per symbol, all on that exact day.
+        let day = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let events = p.earnings_calendar(day, day).await.unwrap();
+        for e in &events {
+            assert_eq!(e.date, day);
+        }
+        // Inverted range yields nothing.
+        let to = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let from = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert!(p.earnings_calendar(from, to).await.unwrap().is_empty());
     }
 }

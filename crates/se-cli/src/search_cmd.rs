@@ -115,6 +115,7 @@ pub async fn run_search(
     search_cfg.score = ScoreConfig::default();
     search_cfg.risk = risk;
     search_cfg.lock_risk = lock_risk;
+    search_cfg.scanner = cfg.scanner;
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(

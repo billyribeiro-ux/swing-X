@@ -16,6 +16,10 @@
 //!   (`^SKEW` returns no data on this tier -> FeatureUnavailable).
 //! * Cross-asset: historical-price-eod for `DXUSD`,`GCUSD`,`CLUSD`,`HGUSD`.
 //! * ETF: `GET /etf/info?symbol=`, `GET /etf/sector-weightings?symbol=`.
+//! * Equity universe: `GET /company-screener?exchange=NASDAQ,NYSE&isEtf=false
+//!   &isFund=false&isActivelyTrading=true&marketCapMoreThan=&limit=` returns
+//!   `[{symbol,marketCap,exchangeShortName,isEtf,isFund,...}]`.
+//! * Earnings: `GET /earnings-calendar?from=&to=` returns `[{symbol,date,...}]`.
 
 use async_trait::async_trait;
 use chrono::NaiveDate;
@@ -25,7 +29,9 @@ use tracing::warn;
 
 use crate::http_util::{parse_ymd, session_close_ts};
 use crate::provider::DataProvider;
-use crate::types::{Capabilities, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote};
+use crate::types::{
+    Capabilities, EarningsEvent, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote,
+};
 
 #[derive(Debug, Clone)]
 pub struct FmpProvider {
@@ -152,6 +158,26 @@ struct EtfInfoRow {
 struct SectorWeightRow {
     #[serde(default, rename = "weightPercentage")]
     weight_percentage: Option<f64>,
+}
+
+/// One row of `/company-screener`. We only need the symbol; `market_cap` is kept
+/// to sort the most-liquid names first when the API doesn't pre-sort.
+#[derive(Debug, Clone, Deserialize)]
+struct ScreenerRow {
+    symbol: String,
+    #[serde(default, rename = "marketCap")]
+    market_cap: Option<f64>,
+    #[serde(default, rename = "isEtf")]
+    is_etf: bool,
+    #[serde(default, rename = "isFund")]
+    is_fund: bool,
+}
+
+/// One row of `/earnings-calendar`. Many more fields exist; we take symbol+date.
+#[derive(Debug, Clone, Deserialize)]
+struct EarningsRow {
+    symbol: String,
+    date: String,
 }
 
 // --- mapping helpers --------------------------------------------------------
@@ -403,6 +429,72 @@ impl DataProvider for FmpProvider {
             top_sector_weight,
         }))
     }
+
+    async fn equity_universe(&self, max: usize) -> Result<Vec<Ticker>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
+        // Common stocks on the two major US exchanges, large-cap and actively
+        // trading. Exclude ETFs/funds at the source; we double-check the flags
+        // below in case the API ignores a filter.
+        let query = format!(
+            "exchange=NASDAQ,NYSE&isEtf=false&isFund=false&isActivelyTrading=true\
+             &marketCapMoreThan=10000000000&limit={max}"
+        );
+        let mut rows = self
+            .get_json::<Vec<ScreenerRow>>("company-screener", &query)
+            .await?;
+        // Most-liquid first: sort by market cap descending (largest unknown last).
+        rows.sort_by(|a, b| {
+            b.market_cap
+                .partial_cmp(&a.market_cap)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut out: Vec<Ticker> = Vec::new();
+        for r in rows {
+            // Defensive: drop anything the API still flags as an ETF/fund.
+            if r.is_etf || r.is_fund {
+                continue;
+            }
+            // Silently skip symbols that fail validation (weird chars, too long).
+            let Ok(ticker) = Ticker::new(&r.symbol) else {
+                continue;
+            };
+            // De-dup while preserving the market-cap ordering.
+            if !out.contains(&ticker) {
+                out.push(ticker);
+            }
+            if out.len() >= max {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn earnings_calendar(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<EarningsEvent>> {
+        let query = format!("from={from}&to={to}");
+        let rows = self
+            .get_json::<Vec<EarningsRow>>("earnings-calendar", &query)
+            .await?;
+        let mut out: Vec<EarningsEvent> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // Skip symbols that fail validation, and rows with unparseable dates.
+            let Ok(ticker) = Ticker::new(&r.symbol) else {
+                continue;
+            };
+            let Some(date) = parse_ymd(&r.date) else {
+                continue;
+            };
+            out.push(EarningsEvent { ticker, date });
+        }
+        out.sort_by(|a, b| (a.date, a.ticker).cmp(&(b.date, b.ticker)));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -532,5 +624,86 @@ mod tests {
             u2,
             "https://financialmodelingprep.com/stable/treasury-rates?apikey=SECRET"
         );
+    }
+
+    #[test]
+    fn equity_universe_url_is_well_formed() {
+        let p = FmpProvider::new("SECRET", "https://financialmodelingprep.com/stable");
+        let query = format!(
+            "exchange=NASDAQ,NYSE&isEtf=false&isFund=false&isActivelyTrading=true\
+             &marketCapMoreThan=10000000000&limit={}",
+            50
+        );
+        let u = p.url("company-screener", &query);
+        assert_eq!(
+            u,
+            "https://financialmodelingprep.com/stable/company-screener?\
+             exchange=NASDAQ,NYSE&isEtf=false&isFund=false&isActivelyTrading=true\
+             &marketCapMoreThan=10000000000&limit=50&apikey=SECRET"
+        );
+    }
+
+    #[test]
+    fn earnings_calendar_url_is_well_formed() {
+        let p = FmpProvider::new("SECRET", "https://financialmodelingprep.com/stable");
+        let from = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let u = p.url("earnings-calendar", &format!("from={from}&to={to}"));
+        assert_eq!(
+            u,
+            "https://financialmodelingprep.com/stable/earnings-calendar?\
+             from=2026-07-01&to=2026-07-31&apikey=SECRET"
+        );
+    }
+
+    #[test]
+    fn parse_screener_rows_filters_and_validates() {
+        // Real-ish screener payload: a clean common stock, an ETF flagged true, a
+        // fund flagged true, and a symbol with an illegal char that must be skipped.
+        let sample = r#"[
+            {"symbol":"AAPL","companyName":"Apple Inc.","marketCap":3500000000000,"exchangeShortName":"NASDAQ","isEtf":false,"isFund":false,"isActivelyTrading":true},
+            {"symbol":"SPY","companyName":"SPDR S&P 500","marketCap":700000000000,"exchangeShortName":"NYSE","isEtf":true,"isFund":false,"isActivelyTrading":true},
+            {"symbol":"VFIAX","companyName":"Vanguard 500","marketCap":900000000000,"exchangeShortName":"NASDAQ","isEtf":false,"isFund":true,"isActivelyTrading":true},
+            {"symbol":"BAD$SYM","companyName":"Junk","marketCap":1,"exchangeShortName":"NYSE","isEtf":false,"isFund":false,"isActivelyTrading":true}
+        ]"#;
+        let rows: Vec<ScreenerRow> = serde_json::from_str(sample).unwrap();
+        assert_eq!(rows.len(), 4);
+        // Replicate the filtering the method applies.
+        let kept: Vec<Ticker> = rows
+            .iter()
+            .filter(|r| !r.is_etf && !r.is_fund)
+            .filter_map(|r| Ticker::new(&r.symbol).ok())
+            .collect();
+        // ETF (SPY), fund (VFIAX) and the garbage symbol are all dropped.
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].as_str(), "AAPL");
+    }
+
+    #[test]
+    fn parse_earnings_rows_skips_bad_symbols_and_dates() {
+        let sample = r#"[
+            {"symbol":"TSLA","date":"2026-07-23","epsEstimated":1.2,"time":"amc"},
+            {"symbol":"AAPL","date":"2026-07-30","epsEstimated":1.5,"time":"amc"},
+            {"symbol":"BAD$SYM","date":"2026-07-15","time":"bmo"},
+            {"symbol":"NVDA","date":"not-a-date","time":"amc"}
+        ]"#;
+        let rows: Vec<EarningsRow> = serde_json::from_str(sample).unwrap();
+        assert_eq!(rows.len(), 4);
+        let events: Vec<EarningsEvent> = rows
+            .iter()
+            .filter_map(|r| {
+                let t = Ticker::new(&r.symbol).ok()?;
+                let d = parse_ymd(&r.date)?;
+                Some(EarningsEvent { ticker: t, date: d })
+            })
+            .collect();
+        // The bad symbol and the unparseable date are dropped; two valid remain.
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].ticker.as_str(), "TSLA");
+        assert_eq!(
+            events[0].date,
+            NaiveDate::from_ymd_opt(2026, 7, 23).unwrap()
+        );
+        assert_eq!(events[1].ticker.as_str(), "AAPL");
     }
 }

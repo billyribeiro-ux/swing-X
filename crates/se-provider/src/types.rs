@@ -106,6 +106,15 @@ impl MacroSeries {
     }
 }
 
+/// A scheduled earnings announcement for a single equity. Consumed by the
+/// earnings-blackout guard downstream (no trade entries within N days of a report).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EarningsEvent {
+    pub ticker: Ticker,
+    /// The announcement date. FMP reports this as the `date` field (`YYYY-MM-DD`).
+    pub date: chrono::NaiveDate,
+}
+
 /// ETF profile/holdings context used by the tradeability gate (flow capacity).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EtfProfile {

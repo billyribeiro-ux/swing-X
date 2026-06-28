@@ -22,4 +22,6 @@ pub use fred::FredProvider;
 pub use mock::MockProvider;
 pub use proprietary::{GexSnapshot, NullProprietary, ProprietaryProvider};
 pub use provider::DataProvider;
-pub use types::{Capabilities, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote};
+pub use types::{
+    Capabilities, EarningsEvent, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote,
+};

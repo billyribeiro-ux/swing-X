@@ -7,6 +7,6 @@
 
 <JournalView
   trades={data.trades}
-  title="Paper-Trade Journal"
-  subtitle="Every fill linked to its originating signal and strategy, with an attribution snapshot."
+  title="Equity Scanner — Journal"
+  subtitle="Every equity fill linked to its originating signal and strategy, with an attribution snapshot."
 />

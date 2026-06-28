@@ -27,6 +27,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use se_core::Scanner;
 use se_store::Store;
 use serde::Deserialize;
 use tower_http::cors::CorsLayer;
@@ -50,6 +51,10 @@ pub struct DateRange {
     pub from: Option<String>,
     #[serde(default)]
     pub to: Option<String>,
+    /// Which scanner to read (`etf` | `equity`). Absent/blank/unknown ⇒ the ETF scanner, so the
+    /// existing ETF pages are unchanged; the equity dashboard passes `scanner=equity`.
+    #[serde(default)]
+    pub scanner: Option<String>,
 }
 
 impl DateRange {
@@ -59,6 +64,19 @@ impl DateRange {
             from: self.from.as_deref().and_then(|s| parse_bound(s, false)),
             to: self.to.as_deref().and_then(|s| parse_bound(s, true)),
         }
+    }
+
+    /// The scanner to filter on. Defaults to [`Scanner::Etf`] when the param is absent, blank, or
+    /// unparseable — so list endpoints never silently mix the two populations.
+    pub fn scanner(&self) -> Option<Scanner> {
+        let s = self
+            .scanner
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<Scanner>().ok())
+            .unwrap_or(Scanner::Etf);
+        Some(s)
     }
 }
 
@@ -140,7 +158,7 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn get_signals(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
-    match queries::signals(&state.store, range.bounds()).await {
+    match queries::signals(&state.store, range.scanner(), range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -159,7 +177,7 @@ async fn get_signal(State(state): State<AppState>, Path(id): Path<String>) -> Re
 }
 
 async fn get_population(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
-    match queries::population(&state.store, range.bounds()).await {
+    match queries::population(&state.store, range.scanner(), range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -173,7 +191,7 @@ async fn get_monitor(State(state): State<AppState>, Query(range): Query<DateRang
 }
 
 async fn get_journal(State(state): State<AppState>, Query(range): Query<DateRange>) -> Response {
-    match queries::journal(&state.store, range.bounds()).await {
+    match queries::journal(&state.store, range.scanner(), range.bounds()).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_response(e),
     }
@@ -210,6 +228,7 @@ mod tests {
         let r = DateRange {
             from: Some("2026-01-01".into()),
             to: Some("2026-12-31".into()),
+            scanner: None,
         };
         let b = r.bounds();
         assert_eq!(b.from.unwrap().to_rfc3339(), "2026-01-01T00:00:00+00:00");
@@ -224,6 +243,7 @@ mod tests {
         let r = DateRange {
             from: Some("2026-06-01T12:30:00Z".into()),
             to: None,
+            scanner: None,
         };
         let b = r.bounds();
         assert_eq!(b.from.unwrap().to_rfc3339(), "2026-06-01T12:30:00+00:00");
@@ -235,6 +255,7 @@ mod tests {
         let r = DateRange {
             from: Some("   ".into()),
             to: Some("not-a-date".into()),
+            scanner: None,
         };
         let b = r.bounds();
         assert!(b.from.is_none());
@@ -243,5 +264,27 @@ mod tests {
 
         let empty = DateRange::default().bounds();
         assert!(empty.is_unbounded());
+    }
+
+    #[test]
+    fn scanner_defaults_to_etf_and_parses_equity() {
+        // Absent / blank / garbage ⇒ ETF (so list endpoints never mix the two populations).
+        assert_eq!(DateRange::default().scanner(), Some(Scanner::Etf));
+        let blank = DateRange {
+            scanner: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(blank.scanner(), Some(Scanner::Etf));
+        let bogus = DateRange {
+            scanner: Some("crypto".into()),
+            ..Default::default()
+        };
+        assert_eq!(bogus.scanner(), Some(Scanner::Etf));
+        // Explicit equity is honored.
+        let eq = DateRange {
+            scanner: Some("equity".into()),
+            ..Default::default()
+        };
+        assert_eq!(eq.scanner(), Some(Scanner::Equity));
     }
 }

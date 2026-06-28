@@ -3,7 +3,7 @@
 //! reads handle the "table empty" case by returning an empty vec.
 
 use chrono::{DateTime, Utc};
-use se_core::{Error, Result};
+use se_core::{Error, Result, Scanner};
 use se_store::sqlx;
 use se_store::sqlx::Row;
 use se_store::Store;
@@ -86,16 +86,20 @@ fn detail_to_string(v: &serde_json::Value) -> String {
 // Signals
 // ---------------------------------------------------------------------------
 
-pub async fn signals(store: &Store, range: DateBounds) -> Result<Vec<SignalDto>> {
+pub async fn signals(
+    store: &Store,
+    scanner: Option<Scanner>,
+    range: DateBounds,
+) -> Result<Vec<SignalDto>> {
     // `decision_ts` is the signal's decision time — the window the operator filters on.
     let sql = format!(
         "SELECT signal_id, strategy_id, ticker, side, decision_ts, horizon, entry, stop, \
                 target1, target2, rr1, rr2, conviction, cohort_n, regime_desc, why, \
                 invalidation, cohort_expectancy, cvar5, lead_time, payload_json \
          FROM signals{} ORDER BY decision_ts DESC LIMIT 500",
-        where_clause("decision_ts", range)
+        where_filter("decision_ts", "scanner", scanner, range)
     );
-    let rows = bind_bounds(sqlx::query(&sql), range)
+    let rows = bind_filter(sqlx::query(&sql), scanner, range)
         .fetch_all(store.pool())
         .await
         .map_err(store_err)?;
@@ -120,6 +124,54 @@ fn bind_bounds<'q>(
     range: DateBounds,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
     let mut q = query;
+    if let Some(from) = range.from {
+        q = q.bind(from);
+    }
+    if let Some(to) = range.to {
+        q = q.bind(to);
+    }
+    q
+}
+
+/// Build a combined `WHERE` for an optional scanner filter + optional date window. Positional
+/// params are assigned (and must be bound by [`bind_filter`]) in the order: scanner, from, to.
+/// Empty string when nothing is constrained, so unfiltered callers are unchanged.
+fn where_filter(
+    date_col: &str,
+    scanner_col: &str,
+    scanner: Option<Scanner>,
+    range: DateBounds,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut idx = 1;
+    if scanner.is_some() {
+        parts.push(format!("{scanner_col} = ${idx}"));
+        idx += 1;
+    }
+    if range.from.is_some() {
+        parts.push(format!("{date_col} >= ${idx}"));
+        idx += 1;
+    }
+    if range.to.is_some() {
+        parts.push(format!("{date_col} <= ${idx}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", parts.join(" AND "))
+    }
+}
+
+/// Bind scanner + bounds positionally to match [`where_filter`] ordering.
+fn bind_filter<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    scanner: Option<Scanner>,
+    range: DateBounds,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let mut q = query;
+    if let Some(s) = scanner {
+        q = q.bind(s.as_str());
+    }
     if let Some(from) = range.from {
         q = q.bind(from);
     }
@@ -198,7 +250,11 @@ fn parse_minutes(s: &str) -> Option<f64> {
 // Population (strategies + latest oos_score)
 // ---------------------------------------------------------------------------
 
-pub async fn population(store: &Store, range: DateBounds) -> Result<Vec<StrategyDto>> {
+pub async fn population(
+    store: &Store,
+    scanner: Option<Scanner>,
+    range: DateBounds,
+) -> Result<Vec<StrategyDto>> {
     // Window strategies by their freshness timestamp: the latest OOS score's
     // `evaluated_at` when one exists, else the strategy's own `created_at`
     // (`COALESCE(o.evaluated_at, s.created_at)`). This keeps freshly created but
@@ -216,9 +272,9 @@ pub async fn population(store: &Store, range: DateBounds) -> Result<Vec<Strategy
              ORDER BY evaluated_at DESC LIMIT 1 \
          ) o ON TRUE{} \
          ORDER BY s.generation DESC, s.created_at DESC LIMIT 500",
-        where_clause(filter_expr, range)
+        where_filter(filter_expr, "s.scanner", scanner, range)
     );
-    let rows = bind_bounds(sqlx::query(&sql), range)
+    let rows = bind_filter(sqlx::query(&sql), scanner, range)
         .fetch_all(store.pool())
         .await
         .map_err(store_err)?;
@@ -322,14 +378,18 @@ fn monitor_event_from_row(row: &sqlx::postgres::PgRow) -> MonitorEventDto {
 // Journal
 // ---------------------------------------------------------------------------
 
-pub async fn journal(store: &Store, range: DateBounds) -> Result<Vec<TradeDto>> {
+pub async fn journal(
+    store: &Store,
+    scanner: Option<Scanner>,
+    range: DateBounds,
+) -> Result<Vec<TradeDto>> {
     let sql = format!(
         "SELECT trade_id, signal_id, strategy_id, ticker, side, mode, entry_ts, fill_px, fill_ts, \
                 exit_ts, exit_px, pnl_r, cost_frac, attribution \
          FROM trades_journal{} ORDER BY entry_ts DESC LIMIT 500",
-        where_clause("entry_ts", range)
+        where_filter("entry_ts", "scanner", scanner, range)
     );
-    let rows = bind_bounds(sqlx::query(&sql), range)
+    let rows = bind_filter(sqlx::query(&sql), scanner, range)
         .fetch_all(store.pool())
         .await
         .map_err(store_err)?;

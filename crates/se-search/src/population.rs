@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt;
 use se_core::{
-    Genome, HorizonProfile, Result, RiskModel, Strategy, StrategyId, StrategyStatus, Ticker,
+    Genome, HorizonProfile, Result, RiskModel, Scanner, Strategy, StrategyId, StrategyStatus,
+    Ticker,
 };
 use se_store::Store;
 use se_validation::ValidationHarness;
@@ -76,6 +77,9 @@ pub struct SearchConfig {
     /// conditions. When false (default), risk geometry is explored and the OOS scoreboard keeps
     /// the best one.
     pub lock_risk: bool,
+    /// Which scanner this population belongs to (ETF vs equity). Tags every persisted strategy so
+    /// the two populations stay separate on the scoreboard, in the journal, and in promotion.
+    pub scanner: Scanner,
 }
 
 /// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
@@ -98,6 +102,7 @@ impl SearchConfig {
             // flag behaves exactly as before, while still being explored).
             risk: RiskModel::from_profile(&profile),
             lock_risk: false,
+            scanner: Scanner::Etf,
         }
     }
 }
@@ -225,7 +230,7 @@ impl<'a> PopulationManager<'a> {
 
     /// Persist a strategy and (if scored) its OOS score.
     async fn persist(&self, ev: &Evaluated) -> Result<()> {
-        persist::upsert_strategy(self.store, &ev.strategy).await?;
+        persist::upsert_strategy(self.store, &ev.strategy, self.cfg.scanner).await?;
         if let Some(score) = &ev.score {
             let fold_spec = serde_json::json!({
                 "n_groups": self.cfg.score.n_groups,

@@ -2,7 +2,7 @@
   import '../app.css';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { navItems } from '$lib/nav';
+  import { navGroups, navItems } from '$lib/nav';
   import { usingLiveApi } from '$lib/api/client';
   import { WifiHigh, WifiSlash } from 'phosphor-svelte';
   import type { Snippet } from 'svelte';
@@ -13,8 +13,25 @@
 
   let { children }: Props = $props();
 
+  /**
+   * The nav entry that best matches the current path: an exact hit, otherwise the
+   * longest `href` that is a path-segment prefix. The longest-prefix rule keeps a
+   * parent like `/equity` from also lighting up when a child route such as
+   * `/equity/journal` (its own nav item) is active.
+   */
+  const activeHref = $derived.by(() => {
+    const path = page.url.pathname;
+    let best: string | null = null;
+    for (const item of navItems) {
+      if (path === item.href || path.startsWith(item.href + '/')) {
+        if (best === null || item.href.length > best.length) best = item.href;
+      }
+    }
+    return best;
+  });
+
   function isActive(href: string): boolean {
-    return page.url.pathname === href || page.url.pathname.startsWith(href + '/');
+    return activeHref === href;
   }
 </script>
 
@@ -42,22 +59,33 @@
       </div>
     </a>
 
-    <nav class="flex flex-col gap-0.5">
-      {#each navItems as item (item.href)}
-        {@const Icon = item.icon}
-        <a
-          href={resolve(item.href)}
-          title={item.hint}
-          aria-current={isActive(item.href) ? 'page' : undefined}
-          class="flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors {isActive(
-            item.href
-          )
-            ? 'bg-base-800/80 font-medium text-base-100'
-            : 'text-base-300 hover:bg-base-800/40 hover:text-base-100'}"
-        >
-          <Icon size={17} weight={isActive(item.href) ? 'fill' : 'regular'} />
-          <span>{item.label}</span>
-        </a>
+    <nav class="flex flex-col gap-3">
+      {#each navGroups as group (group.label ?? group.items[0].href)}
+        <div class="flex flex-col gap-0.5">
+          {#if group.label}
+            <span
+              class="px-2.5 pt-1 pb-0.5 text-[10px] font-semibold tracking-wider text-base-500 uppercase"
+            >
+              {group.label}
+            </span>
+          {/if}
+          {#each group.items as item (item.href)}
+            {@const Icon = item.icon}
+            <a
+              href={resolve(item.href)}
+              title={item.hint}
+              aria-current={isActive(item.href) ? 'page' : undefined}
+              class="flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-colors {isActive(
+                item.href
+              )
+                ? 'bg-base-800/80 font-medium text-base-100'
+                : 'text-base-300 hover:bg-base-800/40 hover:text-base-100'}"
+            >
+              <Icon size={17} weight={isActive(item.href) ? 'fill' : 'regular'} />
+              <span>{item.label}</span>
+            </a>
+          {/each}
+        </div>
       {/each}
     </nav>
 
@@ -76,7 +104,7 @@
           <span>Fixture mode</span>
         {/if}
       </div>
-      <span class="num text-[10px] text-base-600">10-ETF universe · OOS-gated</span>
+      <span class="num text-[10px] text-base-600">ETF + equity scanners · OOS-gated</span>
     </div>
   </aside>
 

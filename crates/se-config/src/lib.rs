@@ -6,7 +6,9 @@
 
 use std::path::Path;
 
-use se_core::{Error, Horizon, HorizonProfile, Result, RiskModel, StopSpec, TargetSpec, Ticker};
+use se_core::{
+    Error, Horizon, HorizonProfile, Result, RiskModel, Scanner, StopSpec, TargetSpec, Ticker,
+};
 
 /// Fully-resolved application configuration.
 #[derive(Debug, Clone)]
@@ -15,6 +17,10 @@ pub struct AppConfig {
     pub ml_worker_url: String,
     pub api_bind: String,
     pub horizon: HorizonProfile,
+    /// Which scanner this run targets (`SE_SCANNER`: `etf` | `equity`). Tags strategies/signals/
+    /// trades so the two populations never mix. Default: ETF.
+    pub scanner: Scanner,
+    /// The ACTIVE scanner's universe: the 10 ETFs for `etf`, or the equity list for `equity`.
     pub universe: Vec<Ticker>,
     pub fmp_configured: bool,
     pub fred_configured: bool,
@@ -58,18 +64,62 @@ impl AppConfig {
             .map(|v| parse_bool(&v))
             .unwrap_or(false);
 
+        let scanner = std::env::var("SE_SCANNER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.parse::<Scanner>())
+            .transpose()
+            .map_err(|e| Error::Config(e.to_string()))?
+            .unwrap_or_default();
+
+        let universe = match scanner {
+            Scanner::Etf => Ticker::ALL.to_vec(),
+            Scanner::Equity => resolve_equity_universe()?,
+        };
+
         Ok(AppConfig {
             database_url,
             ml_worker_url,
             api_bind,
             horizon: profile,
-            universe: Ticker::ALL.to_vec(),
+            scanner,
+            universe,
             fmp_configured,
             fred_configured,
             risk,
             lock_risk,
         })
     }
+}
+
+/// A default seed equity universe — liquid US large-caps — used when `SE_EQUITY_UNIVERSE` is
+/// unset. The CLI can override this by fetching the full universe from the provider ("all US
+/// stocks"); this seed just guarantees the equity scanner always has something to scan offline.
+pub const DEFAULT_EQUITY_SEED: &[&str] = &[
+    "TSLA", "AAPL", "META", "NVDA", "AMZN", "GOOGL", "MSFT", "AMD", "NFLX", "CRM", "AVGO", "COST",
+    "PEP", "ADBE", "INTC", "CSCO", "QCOM", "TXN", "AMAT", "MU",
+];
+
+/// Resolve the equity scanner's universe from `SE_EQUITY_UNIVERSE` (comma/space-separated
+/// symbols), falling back to [`DEFAULT_EQUITY_SEED`]. Invalid symbols are rejected loudly.
+fn resolve_equity_universe() -> Result<Vec<Ticker>> {
+    let raw = std::env::var("SE_EQUITY_UNIVERSE").unwrap_or_default();
+    let syms: Vec<&str> = if raw.trim().is_empty() {
+        DEFAULT_EQUITY_SEED.to_vec()
+    } else {
+        raw.split([',', ' ', '\n', '\t'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let mut out = Vec::with_capacity(syms.len());
+    for s in syms {
+        out.push(
+            s.parse::<Ticker>()
+                .map_err(|e| Error::Config(e.to_string()))?,
+        );
+    }
+    Ok(out)
 }
 
 /// Resolve the operator's ground-rule [`RiskModel`] from `SE_STOP`/`SE_TARGET1`/`SE_TARGET2`,

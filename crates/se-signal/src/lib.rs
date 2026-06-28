@@ -18,7 +18,7 @@ pub mod conviction;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use se_core::{Driver, HorizonProfile, Result, Side, Signal, Strategy, Ticker};
+use se_core::{Driver, HorizonProfile, Result, Scanner, Side, Signal, Strategy, Ticker};
 use se_features::indicators::atr;
 use se_features::{
     EventOverlay, FeatureContext, FeatureModule, LocationModule, RegimeModule, TradeabilityModule,
@@ -240,15 +240,16 @@ pub async fn generate_signals(
     store: &Store,
     profile: &HorizonProfile,
     universe: &[Ticker],
+    scanner: Scanner,
 ) -> Result<Vec<Signal>> {
-    let promoted = load_promoted(store, profile.horizon.as_str()).await?;
+    let promoted = load_promoted(store, profile.horizon.as_str(), scanner).await?;
     let mut out = Vec::new();
     for strategy in &promoted {
         for &ticker in universe {
             match build_signal_for(store, strategy, ticker, profile).await? {
                 SignalAttempt::Emitted(sig) => {
                     let sig = *sig;
-                    persist_signal(store, &sig).await?;
+                    persist_signal(store, &sig, scanner).await?;
                     out.push(sig);
                 }
                 SignalAttempt::Skipped(reason) => {
@@ -261,7 +262,7 @@ pub async fn generate_signals(
 }
 
 /// Persist one signal to the `signals` table (idempotent on `signal_id`).
-pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
+pub async fn persist_signal(store: &Store, sig: &Signal, scanner: Scanner) -> Result<()> {
     let why_json =
         serde_json::to_value(&sig.why).map_err(|e| se_core::Error::Store(e.to_string()))?;
     let payload_json =
@@ -276,8 +277,9 @@ pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
         "INSERT INTO signals \
             (signal_id, strategy_id, ticker, side, decision_ts, horizon, entry, stop, \
              target1, target2, rr1, rr2, conviction, cohort_n, regime_desc, why, invalidation, \
-             cohort_expectancy, cvar5, lead_time, payload_json, payload_human) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) \
+             cohort_expectancy, cvar5, lead_time, payload_json, payload_human, scanner) \
+         VALUES \
+            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) \
          ON CONFLICT (signal_id) DO NOTHING",
     )
     .bind(sig.id.inner())
@@ -302,6 +304,7 @@ pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
     .bind(&sig.lead_time)
     .bind(payload_json)
     .bind(payload_human)
+    .bind(scanner.as_str())
     .execute(store.pool())
     .await
     .map_err(|e| se_core::Error::Store(e.to_string()))?;

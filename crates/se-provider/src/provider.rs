@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 use se_core::{Bar, Error, Result, Ticker};
 
-use crate::types::{Capabilities, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote};
+use crate::types::{
+    Capabilities, EarningsEvent, EtfProfile, MacroPoint, MacroSeries, ProviderKind, Quote,
+};
 
 #[async_trait]
 pub trait DataProvider: Send + Sync {
@@ -41,5 +43,22 @@ pub trait DataProvider: Send + Sync {
     /// ETF profile/holdings context (flow capacity for the tradeability gate).
     async fn etf_profile(&self, _ticker: Ticker) -> Result<Option<EtfProfile>> {
         Ok(None)
+    }
+
+    /// The equity scanner's universe: up to `max` liquid US common-stock symbols.
+    /// Default is empty so adapters that serve no equity universe (FRED,
+    /// proprietary) need not override — callers fall back to another provider.
+    async fn equity_universe(&self, _max: usize) -> Result<Vec<Ticker>> {
+        Ok(vec![])
+    }
+
+    /// Scheduled earnings announcements over the inclusive date range, for the
+    /// downstream earnings-blackout guard. Default is empty (no announcements).
+    async fn earnings_calendar(
+        &self,
+        _from: NaiveDate,
+        _to: NaiveDate,
+    ) -> Result<Vec<EarningsEvent>> {
+        Ok(vec![])
     }
 }
