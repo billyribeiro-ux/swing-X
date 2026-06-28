@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("connect db")?;
             store.migrate().await.context("migrate")?;
-            sanity::run(&store, &[Ticker::Spy, Ticker::Qqq]).await?;
+            sanity::run(&store, &[Ticker::SPY, Ticker::QQQ]).await?;
         }
         Cmd::Search(args) => {
             let risk = search_cmd::RiskArgs {

@@ -419,7 +419,7 @@ mod tests {
         ]"#;
         let rows: Vec<EodRow> = serde_json::from_str(sample).unwrap();
         assert_eq!(rows.len(), 2);
-        let mut bars: Vec<Bar> = rows.iter().filter_map(|r| r.to_bar(Ticker::Spy)).collect();
+        let mut bars: Vec<Bar> = rows.iter().filter_map(|r| r.to_bar(Ticker::SPY)).collect();
         bars.sort_by_key(|b| b.ts);
         assert_eq!(bars.len(), 2);
         // ascending after sort: 06-25 then 06-26
@@ -428,7 +428,7 @@ mod tests {
             session_close_ts(parse_ymd("2026-06-25").unwrap())
         );
         let b = &bars[1];
-        assert_eq!(b.ticker, Ticker::Spy);
+        assert_eq!(b.ticker, Ticker::SPY);
         assert_eq!(b.close, 728.99);
         assert!(b.high >= b.low);
         assert!(b.high >= b.open && b.high >= b.close);

@@ -386,7 +386,7 @@ mod tests {
         // Signal::new must accept this geometry (directionally consistent).
         let sig = Signal::new(
             StrategyId::new(),
-            Ticker::Spy,
+            Ticker::SPY,
             g.side,
             se_core::DecisionTs::new(Utc::now()),
             g.horizon,

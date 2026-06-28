@@ -56,7 +56,7 @@ async fn macro_pit_excludes_future_knowledge() {
     assert_eq!(n, 2, "two distinct (series, ts, as_of) rows should insert");
 
     // The macro store ignores the ticker; any ticker yields the same cutoff read.
-    let pit = store.pit(Ticker::Spy, decision);
+    let pit = store.pit(Ticker::SPY, decision);
 
     // At the decision bar: the clean value is the latest visible; the lagged one
     // (as_of in the future) is hidden -> value is the clean 1.0, not 9.0.
@@ -79,7 +79,7 @@ async fn macro_pit_excludes_future_knowledge() {
     // Eight days later, the lagged release's as_of has passed -> it becomes the
     // latest visible value for its (later) reference date.
     let later = DecisionTs::new(decision.inner() + Duration::days(8));
-    let pit2 = store.pit(Ticker::Qqq, later);
+    let pit2 = store.pit(Ticker::QQQ, later);
     let v2 = pit2.macro_value_as_of(series).await.unwrap();
     assert_eq!(
         v2,
@@ -128,7 +128,7 @@ async fn macro_history_keeps_latest_vintage_per_ts() {
     };
     store.upsert_macro(&[initial, revision]).await.unwrap();
 
-    let pit = store.pit(Ticker::Spy, decision);
+    let pit = store.pit(Ticker::SPY, decision);
     assert_eq!(
         pit.macro_value_as_of(series).await.unwrap(),
         Some(5.5),

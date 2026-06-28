@@ -31,34 +31,51 @@ fn hash01(tag: &str, a: i64, b: u64) -> f64 {
 }
 
 fn ticker_base_price(t: Ticker) -> f64 {
-    match t {
-        Ticker::Spy => 530.0,
-        Ticker::Qqq => 460.0,
-        Ticker::Iwm => 205.0,
-        Ticker::Dia => 400.0,
-        Ticker::Xlf => 42.0,
-        Ticker::Xlk => 225.0,
-        Ticker::Xle => 92.0,
-        Ticker::Smh => 235.0,
-        Ticker::Xlv => 150.0,
-        Ticker::Xlu => 70.0,
+    const TABLE: &[(Ticker, f64)] = &[
+        (Ticker::SPY, 530.0),
+        (Ticker::QQQ, 460.0),
+        (Ticker::IWM, 205.0),
+        (Ticker::DIA, 400.0),
+        (Ticker::XLF, 42.0),
+        (Ticker::XLK, 225.0),
+        (Ticker::XLE, 92.0),
+        (Ticker::SMH, 235.0),
+        (Ticker::XLV, 150.0),
+        (Ticker::XLU, 70.0),
+    ];
+    if let Some(&(_, px)) = TABLE.iter().find(|(tk, _)| *tk == t) {
+        return px;
     }
+    // Arbitrary equity (mock mode): a deterministic base price in [20, 470) from the symbol.
+    20.0 + (symbol_seed(t) % 450) as f64
 }
 
 fn ticker_base_volume(t: Ticker) -> f64 {
     // Rough daily share volume; broad indices trade far more than sectors.
-    match t {
-        Ticker::Spy => 70_000_000.0,
-        Ticker::Qqq => 45_000_000.0,
-        Ticker::Iwm => 30_000_000.0,
-        Ticker::Dia => 4_000_000.0,
-        Ticker::Xlf => 40_000_000.0,
-        Ticker::Xlk => 8_000_000.0,
-        Ticker::Xle => 18_000_000.0,
-        Ticker::Smh => 9_000_000.0,
-        Ticker::Xlv => 9_000_000.0,
-        Ticker::Xlu => 12_000_000.0,
+    const TABLE: &[(Ticker, f64)] = &[
+        (Ticker::SPY, 70_000_000.0),
+        (Ticker::QQQ, 45_000_000.0),
+        (Ticker::IWM, 30_000_000.0),
+        (Ticker::DIA, 4_000_000.0),
+        (Ticker::XLF, 40_000_000.0),
+        (Ticker::XLK, 8_000_000.0),
+        (Ticker::XLE, 18_000_000.0),
+        (Ticker::SMH, 9_000_000.0),
+        (Ticker::XLV, 9_000_000.0),
+        (Ticker::XLU, 12_000_000.0),
+    ];
+    if let Some(&(_, vol)) = TABLE.iter().find(|(tk, _)| *tk == t) {
+        return vol;
     }
+    // Arbitrary equity (mock mode): a deterministic daily volume in [1M, 26M).
+    1_000_000.0 + (symbol_seed(t) % 25) as f64 * 1_000_000.0
+}
+
+/// A small deterministic seed derived from a symbol's bytes (mock determinism for equities).
+fn symbol_seed(t: Ticker) -> u64 {
+    t.as_str().bytes().fold(1469598103934665603u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(1099511628211)
+    })
 }
 
 fn synth_bar(ticker: Ticker, date: NaiveDate) -> Bar {
@@ -233,8 +250,8 @@ mod tests {
         let p = MockProvider;
         let start = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         let end = NaiveDate::from_ymd_opt(2025, 1, 31).unwrap();
-        let a = p.daily_bars(Ticker::Spy, start, end).await.unwrap();
-        let b = p.daily_bars(Ticker::Spy, start, end).await.unwrap();
+        let a = p.daily_bars(Ticker::SPY, start, end).await.unwrap();
+        let b = p.daily_bars(Ticker::SPY, start, end).await.unwrap();
         assert_eq!(a, b, "mock output must be deterministic");
         assert!(!a.is_empty());
         for bar in &a {

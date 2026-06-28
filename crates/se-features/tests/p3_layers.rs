@@ -51,7 +51,7 @@ async fn p3_layers_produce_finite_features() {
 
     // Evaluate against a non-benchmark sector ETF so rs_vs_spy goes through the
     // real cross-ticker path (SPY would short-circuit to 0).
-    let pit = store.pit(Ticker::Xlk, decision);
+    let pit = store.pit(Ticker::XLK, decision);
     let ctx = FeatureContext::new(&pit, &prop, profile);
 
     let location = LocationModule::new();
@@ -105,7 +105,7 @@ async fn p3_layers_produce_finite_features() {
         .iter()
         .chain(trig.iter())
         .chain(evt.iter())
-        .map(|f| se_store::FeatureWrite::from_feature(Ticker::Xlk, decision, f))
+        .map(|f| se_store::FeatureWrite::from_feature(Ticker::XLK, decision, f))
         .collect();
     store.insert_features(&writes).await.unwrap();
 

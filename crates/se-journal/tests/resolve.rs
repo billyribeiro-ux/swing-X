@@ -53,7 +53,7 @@ async fn journal_resolves_a_paper_trade_with_next_bar_fill() {
     let target1 = entry * 1.10;
     let signal = Signal::new(
         StrategyId::new(),
-        Ticker::Spy,
+        Ticker::SPY,
         Side::Long,
         se_core::DecisionTs::new(ts),
         profile.horizon,

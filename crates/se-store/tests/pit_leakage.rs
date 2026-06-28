@@ -26,7 +26,7 @@ async fn pit_excludes_future_knowledge() {
     // clean up any leftovers from a prior run
     store.delete_features_by_source("pit_test").await.unwrap();
 
-    let ticker = Ticker::Spy;
+    let ticker = Ticker::SPY;
     let decision = DecisionTs::new(Utc.with_ymd_and_hms(2025, 1, 10, 21, 0, 0).unwrap());
 
     // Clean: knowable exactly at the decision bar.

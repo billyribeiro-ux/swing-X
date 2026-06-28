@@ -279,7 +279,7 @@ mod tests {
 
     fn bar(o: f64, h: f64, l: f64, c: f64) -> Bar {
         Bar {
-            ticker: Ticker::Spy,
+            ticker: Ticker::SPY,
             ts: chrono::Utc::now(),
             open: o,
             high: h,

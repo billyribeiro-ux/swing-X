@@ -241,7 +241,7 @@ mod tests {
 
     fn bar(ts_day: i64, o: f64, h: f64, l: f64, c: f64, v: f64) -> Bar {
         Bar {
-            ticker: Ticker::Spy,
+            ticker: Ticker::SPY,
             ts: Utc.with_ymd_and_hms(2024, 1, 1, 21, 0, 0).unwrap() + Duration::days(ts_day),
             open: o,
             high: h,
