@@ -1,0 +1,22 @@
+{
+  "name": "swing-x",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": ">=10"
+  },
+  "scripts": {
+    "dev:web": "pnpm --filter @swing-x/web dev",
+    "build:web": "pnpm --filter @swing-x/web build",
+    "check:web": "pnpm --filter @swing-x/web check",
+    "test:web": "pnpm --filter @swing-x/web test",
+    "db:up": "bash scripts/db-up.sh",
+    "db:down": "docker compose down",
+    "backend:build": "cargo build --workspace",
+    "backend:test": "cargo test --workspace",
+    "backend:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "ml:dev": "cd ml-worker && uv run uvicorn se_ml.server:app --reload --port 8088"
+  }
+}

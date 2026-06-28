@@ -1,0 +1,44 @@
+# --- secrets (NEVER commit) ---
+.env
+.env.local
+*.key
+secrets/
+
+# --- Rust ---
+/target
+**/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# --- Node / pnpm ---
+node_modules/
+.pnpm-store/
+.svelte-kit/
+apps/web/build/
+apps/web/.svelte-kit/
+packages/*/dist/
+*.tsbuildinfo
+
+# --- Python ---
+ml-worker/.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+ml-worker/dist/
+
+# --- data / artifacts ---
+/data/
+/artifacts/
+*.parquet
+*.duckdb
+*.sqlite
+pgdata/
+
+# --- editor / os ---
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.log

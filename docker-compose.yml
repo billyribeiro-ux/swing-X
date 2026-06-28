@@ -1,0 +1,31 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: swingx-db
+    environment:
+      POSTGRES_USER: swing
+      POSTGRES_PASSWORD: swing
+      POSTGRES_DB: swing
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U swing -d swing"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command: ["postgres", "-c", "shared_preload_libraries=timescaledb"]
+
+  ml-worker:
+    build:
+      context: ./ml-worker
+    container_name: swingx-ml
+    environment:
+      ML_WORKER_PORT: "8088"
+    ports:
+      - "8088:8088"
+    depends_on:
+      db:
+        condition: service_healthy
+    profiles: ["full"]
