@@ -125,10 +125,11 @@ pub async fn run(
     };
     let (from_ts, to_ts) = (session_close(from_date), session_close(to_date));
 
-    let promoted = load_promoted(&store, profile.horizon.as_str()).await?;
+    let promoted = load_promoted(&store, profile.horizon.as_str(), cfg.scanner).await?;
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
-        " se trades │ horizon={} │ {} → {} │ promoted strategies: {}",
+        " se trades │ {} │ horizon={} │ {} → {} │ promoted strategies: {}",
+        cfg.scanner.label(),
         profile.horizon.as_str(),
         from_date,
         to_date,
@@ -140,8 +141,10 @@ pub async fn run(
         return Ok(());
     }
 
-    // Idempotent: clear prior backtest trades so a re-run replaces them.
-    sqlx::query("DELETE FROM trades_journal WHERE mode = 'backtest'")
+    // Idempotent: clear prior backtest trades for THIS scanner so a re-run replaces them (without
+    // wiping the other scanner's backtest journal).
+    sqlx::query("DELETE FROM trades_journal WHERE mode = 'backtest' AND scanner = $1")
+        .bind(cfg.scanner.as_str())
         .execute(store.pool())
         .await
         .context("clear prior backtest trades")?;
@@ -172,8 +175,8 @@ pub async fn run(
                 sqlx::query(
                     "INSERT INTO trades_journal \
                      (trade_id, strategy_id, ticker, side, mode, entry_ts, fill_px, fill_ts, \
-                      exit_px, exit_ts, pnl_r, cost_frac, attribution) \
-                     VALUES ($1,$2,$3,$4,'backtest',$5,$6,$5,$7,$8,$9,$10,$11)",
+                      exit_px, exit_ts, pnl_r, cost_frac, attribution, scanner) \
+                     VALUES ($1,$2,$3,$4,'backtest',$5,$6,$5,$7,$8,$9,$10,$11,$12)",
                 )
                 .bind(Uuid::new_v4())
                 .bind(strat.id.inner())
@@ -189,6 +192,7 @@ pub async fn run(
                     "outcome": ev.outcome.as_str(),
                     "regime": entry.regime,
                 }))
+                .bind(cfg.scanner.as_str())
                 .execute(store.pool())
                 .await
                 .context("insert backtest trade")?;
@@ -253,9 +257,10 @@ pub async fn run(
              WHERE strategy_id = s.strategy_id \
              ORDER BY evaluated_at DESC LIMIT 1 \
          ) latest ON TRUE \
-         WHERE s.status = 'promoted' AND s.horizon = $1",
+         WHERE s.status = 'promoted' AND s.horizon = $1 AND s.scanner = $2",
     )
     .bind(profile.horizon.as_str())
+    .bind(cfg.scanner.as_str())
     .fetch_one(store.pool())
     .await
     .ok()

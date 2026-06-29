@@ -95,14 +95,22 @@ pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
                         ingest::ingest_bars(&store, &fmp, "fmp", &cfg.universe, from, to).await?;
                     let rep =
                         ingest::ingest_macro(&store, Some(&fmp), Some(&fred), from, to).await?;
-                    println!("  ingested {n} bar-rows │ {}", rep.summary_line());
+                    let e = ingest::ingest_earnings(&store, &fmp, &cfg.universe, from, to).await?;
+                    println!(
+                        "  ingested {n} bar-rows │ {e} earnings │ {}",
+                        rep.summary_line()
+                    );
                 }
                 "mock" => {
                     let mock = MockProvider;
                     let n =
                         ingest::ingest_bars(&store, &mock, "mock", &cfg.universe, from, to).await?;
                     let rep = ingest::ingest_macro_via(&store, &mock, from, to).await?;
-                    println!("  ingested {n} bar-rows │ {}", rep.summary_line());
+                    let e = ingest::ingest_earnings(&store, &mock, &cfg.universe, from, to).await?;
+                    println!(
+                        "  ingested {n} bar-rows │ {e} earnings │ {}",
+                        rep.summary_line()
+                    );
                 }
                 other => bail!("unknown provider '{other}'"),
             },

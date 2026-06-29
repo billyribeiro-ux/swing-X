@@ -21,6 +21,14 @@ use se_validation::{GateDecision, ValidationHarness};
 /// crash (see [`crate::population`]).
 pub const MIN_ENTRIES_TO_VALIDATE: usize = 40;
 
+/// The minimum number of OOS trades a genome must ACT ON (at the acting threshold τ\*) before it
+/// may be promoted. A genome that fires (and so produces labeled entries) but acts on almost no
+/// OOS trades has no real out-of-sample track record to promote on; it may still be kept as a
+/// survivor/candidate to mutate, but it is not promotable. Paired with the actionable-predicate
+/// guardrail in [`genome_has_actionable_predicate`] this kills degenerate regime/tradeability-only
+/// promotions. See [`crate::population`].
+pub const MIN_ACTED_TO_PROMOTE: usize = 8;
+
 /// An out-of-sample score for one strategy. The ONLY sortable summary the search keeps.
 ///
 /// Constructed only from OOS validation output + the gate. The fields below are all OOS or
@@ -46,6 +54,16 @@ pub struct OosScore {
     pub gate: GateDecision,
     /// Number of labeled entries that fed the validation (cohort size).
     pub n_entries: usize,
+    /// OOS precision at τ\* — the north-star metric. Surfaced and persisted, NOT a ranking key
+    /// (cost-aware OOS expectancy is already precision-conditioned upstream).
+    pub precision_oos: f64,
+    /// OOS recall at τ\*.
+    pub recall_oos: f64,
+    /// τ\* — the acting threshold in [0,1] the meta-label classifier acts at.
+    pub act_threshold: f64,
+    /// Count of OOS trades acted on at τ\* (the acted cohort). Gates promotability via
+    /// [`MIN_ACTED_TO_PROMOTE`]; distinct from `n_entries` (total labeled).
+    pub n_acted_oos: i64,
 }
 
 impl OosScore {
@@ -70,6 +88,10 @@ impl OosScore {
             passed_gate: gate.passed,
             gate,
             n_entries,
+            precision_oos: validation.precision_oos,
+            recall_oos: validation.recall_oos,
+            act_threshold: validation.act_threshold,
+            n_acted_oos: validation.n_acted_oos,
         }
     }
 
@@ -113,6 +135,18 @@ impl OosScore {
         // Descending (best first); fall back to Equal on NaN.
         b.partial_cmp(&a).unwrap_or(Ordering::Equal)
     }
+}
+
+/// Whether a genome carries at least one ACTIONABLE entry condition — a predicate on the
+/// [`Layer::Trigger`] or [`Layer::Location`] layer. Regime / tradeability / event predicates only
+/// *condition* an entry; on their own they fire trivially (e.g. "we're in a bull regime") without
+/// any real entry trigger, which is the root cause of degenerate promotions. A genome that lacks
+/// any trigger/location predicate must not be promoted (it may still be kept as a survivor).
+pub fn genome_has_actionable_predicate(genome: &se_core::Genome) -> bool {
+    genome
+        .predicates
+        .iter()
+        .any(|p| matches!(p.layer, se_core::Layer::Trigger | se_core::Layer::Location))
 }
 
 /// CPCV / DSR shaping for the OOS validation. Modest defaults that work for single-ticker
@@ -180,6 +214,10 @@ mod tests {
             regime_contrib: BTreeMap::new(),
             n_regimes_positive: n_pos,
             passed_gate: false,
+            precision_oos: 0.0,
+            recall_oos: 0.0,
+            act_threshold: 0.5,
+            n_acted_oos: 0,
         }
     }
 
@@ -231,5 +269,56 @@ mod tests {
             80,
         );
         assert!(!dead.is_survivor());
+    }
+
+    #[test]
+    fn from_validation_copies_precision_fields() {
+        let mut v = vr(0.5, 0.1, 0.05, 3);
+        v.precision_oos = 0.62;
+        v.recall_oos = 0.41;
+        v.act_threshold = 0.58;
+        v.n_acted_oos = 23;
+        let s = OosScore::from_validation(
+            StrategyId::new(),
+            &v,
+            se_validation::PromotionGate::evaluate(&v),
+            80,
+        );
+        assert_eq!(s.precision_oos, 0.62);
+        assert_eq!(s.recall_oos, 0.41);
+        assert_eq!(s.act_threshold, 0.58);
+        assert_eq!(s.n_acted_oos, 23);
+    }
+
+    #[test]
+    fn actionable_predicate_detection() {
+        use se_core::{CmpOp, Genome, Horizon, Layer, Predicate, Side};
+
+        let pred = |layer: Layer| Predicate {
+            layer,
+            feature_key: "k".into(),
+            op: CmpOp::Gt,
+            threshold: 0.0,
+        };
+
+        // Regime/tradeability/event only -> NOT actionable.
+        let regime_only = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![pred(Layer::Regime), pred(Layer::Tradeability)],
+        );
+        assert!(!genome_has_actionable_predicate(&regime_only));
+
+        // A trigger predicate -> actionable.
+        let with_trigger = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![pred(Layer::Regime), pred(Layer::Trigger)],
+        );
+        assert!(genome_has_actionable_predicate(&with_trigger));
+
+        // A location predicate -> actionable.
+        let with_location = Genome::new(Side::Long, Horizon::Swing, vec![pred(Layer::Location)]);
+        assert!(genome_has_actionable_predicate(&with_location));
     }
 }

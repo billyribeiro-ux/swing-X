@@ -219,7 +219,7 @@ mod tests {
             }
             points.push(BarPoint {
                 bar: Bar {
-                    ticker: Ticker::Spy,
+                    ticker: Ticker::SPY,
                     ts: chrono::Utc::now(),
                     open: 1.0,
                     high: 1.0,
@@ -233,7 +233,7 @@ mod tests {
             });
         }
         FeatureWindow {
-            ticker: Ticker::Spy,
+            ticker: Ticker::SPY,
             bars: Vec::new(),
             points,
         }

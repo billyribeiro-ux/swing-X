@@ -42,3 +42,4 @@ pgdata/
 .vscode/*
 !.vscode/extensions.json
 *.log
+equity_universe.txt

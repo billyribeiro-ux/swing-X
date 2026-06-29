@@ -6,7 +6,6 @@ import {
   REGIMES,
   SIDES,
   STRATEGY_STATUSES,
-  TICKERS,
   TRADE_MODES
 } from '@swing-x/shared-types';
 
@@ -17,7 +16,11 @@ import {
  * `satisfies` guards below keep these schemas structurally aligned.
  */
 
-export const tickerSchema = z.enum(TICKERS);
+// Open-universe ticker: the ETF scanner emits the fixed TICKERS list, but the
+// equity scanner emits arbitrary stock symbols (TSLA, AAPL, ...). Validating
+// against the closed ETF enum would fail every equity payload and silently fall
+// back to fixtures, so accept any non-empty string at the trust boundary.
+export const tickerSchema = z.string().min(1);
 export const sideSchema = z.enum(SIDES);
 export const horizonSchema = z.enum(HORIZONS);
 export const regimeSchema = z.enum(REGIMES);
@@ -66,6 +69,10 @@ export const oosScoreSchema = z.object({
   mar: z.number(),
   nRegimesPositive: z.number(),
   passedGate: z.boolean(),
+  precisionOos: z.number().optional(),
+  recallOos: z.number().optional(),
+  actThreshold: z.number().optional(),
+  nActed: z.number().optional(),
   evaluatedAt: z.string()
 });
 

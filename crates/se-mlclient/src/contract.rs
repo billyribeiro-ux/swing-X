@@ -127,6 +127,12 @@ pub struct MlImportanceRequest {
     pub model_id: String,
 }
 
+/// Default acting threshold τ\* (0.5) for `ValidationResult::act_threshold` when a worker
+/// response omits it (e.g. an older worker or a hand-built test fixture).
+fn default_act_threshold() -> f64 {
+    0.5
+}
+
 /// `POST /validate` response body. This is the authoritative input to the promotion gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ValidationResult {
@@ -139,6 +145,22 @@ pub struct ValidationResult {
     pub regime_contrib: BTreeMap<String, f64>,
     pub n_regimes_positive: i64,
     pub passed_gate: bool,
+    /// OOS precision: fraction of OOS trades ACTED ON (prob >= τ\*) that were profitable. The
+    /// north-star meta-labeling metric. Surfaced and persisted; never a ranking key here (the
+    /// cost-aware OOS expectancy is already precision-conditioned upstream).
+    #[serde(default)]
+    pub precision_oos: f64,
+    /// OOS recall at τ\*: fraction of profitable OOS trades that were acted on.
+    #[serde(default)]
+    pub recall_oos: f64,
+    /// τ\* — the acting threshold in [0,1] the meta-label classifier acts at. Defaults to 0.5
+    /// when absent so older worker responses / fixtures still deserialize.
+    #[serde(default = "default_act_threshold")]
+    pub act_threshold: f64,
+    /// Count of OOS trades acted on at τ\* (the acted cohort size). Drives the search guardrail
+    /// that refuses to promote genomes that act on too few OOS trades.
+    #[serde(default)]
+    pub n_acted_oos: i64,
 }
 
 // --------------------------------------------------------------------------- //

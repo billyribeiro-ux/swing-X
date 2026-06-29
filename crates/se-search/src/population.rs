@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt;
 use se_core::{
-    Genome, HorizonProfile, Result, RiskModel, Strategy, StrategyId, StrategyStatus, Ticker,
+    Genome, HorizonProfile, Result, RiskModel, Scanner, Strategy, StrategyId, StrategyStatus,
+    Ticker,
 };
 use se_store::Store;
 use se_validation::ValidationHarness;
@@ -22,7 +23,10 @@ use crate::backtest::{assemble, backtest};
 use crate::feature_matrix::{build_window, FeatureWindow};
 use crate::risk_search::RiskSpace;
 use crate::rng::Rng;
-use crate::score::{score_oos, OosScore, ScoreConfig, MIN_ENTRIES_TO_VALIDATE};
+use crate::score::{
+    genome_has_actionable_predicate, score_oos, OosScore, ScoreConfig, MIN_ACTED_TO_PROMOTE,
+    MIN_ENTRIES_TO_VALIDATE,
+};
 use crate::seed::{seed_population, FeatureCatalog};
 use crate::{genome_ops, persist};
 
@@ -45,9 +49,22 @@ impl Evaluated {
             .unwrap_or(false)
     }
 
-    /// Whether this member is promotable (hard gate passed).
+    /// Whether this member is promotable. The hard gate passing is necessary but NOT sufficient:
+    /// the search guardrail also requires (a) the genome carries an actionable entry condition
+    /// (a trigger/location predicate — not a regime/tradeability/event-only conjunction that fires
+    /// trivially) and (b) the validation acted on at least [`MIN_ACTED_TO_PROMOTE`] OOS trades, so
+    /// there is a real out-of-sample track record behind the promotion. A gate-passer that fails
+    /// the guardrail is NOT promoted but is still kept as a survivor (see `is_survivor`), never
+    /// retired for this reason.
     pub fn promotable(&self) -> bool {
-        self.score.as_ref().map(|s| s.passed_gate).unwrap_or(false)
+        match &self.score {
+            Some(s) => {
+                s.passed_gate
+                    && genome_has_actionable_predicate(&self.strategy.genome)
+                    && s.n_acted_oos as usize >= MIN_ACTED_TO_PROMOTE
+            }
+            None => false,
+        }
     }
 }
 
@@ -76,6 +93,9 @@ pub struct SearchConfig {
     /// conditions. When false (default), risk geometry is explored and the OOS scoreboard keeps
     /// the best one.
     pub lock_risk: bool,
+    /// Which scanner this population belongs to (ETF vs equity). Tags every persisted strategy so
+    /// the two populations stay separate on the scoreboard, in the journal, and in promotion.
+    pub scanner: Scanner,
 }
 
 /// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
@@ -98,6 +118,7 @@ impl SearchConfig {
             // flag behaves exactly as before, while still being explored).
             risk: RiskModel::from_profile(&profile),
             lock_risk: false,
+            scanner: Scanner::Etf,
         }
     }
 }
@@ -225,7 +246,7 @@ impl<'a> PopulationManager<'a> {
 
     /// Persist a strategy and (if scored) its OOS score.
     async fn persist(&self, ev: &Evaluated) -> Result<()> {
-        persist::upsert_strategy(self.store, &ev.strategy).await?;
+        persist::upsert_strategy(self.store, &ev.strategy, self.cfg.scanner).await?;
         if let Some(score) = &ev.score {
             let fold_spec = serde_json::json!({
                 "n_groups": self.cfg.score.n_groups,
@@ -416,5 +437,103 @@ impl EvolveOutcome {
             }
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use se_core::{CmpOp, Genome, Horizon, Layer, Predicate, Side};
+    use se_mlclient::ValidationResult;
+
+    fn pred(layer: Layer) -> Predicate {
+        Predicate {
+            layer,
+            feature_key: "k".into(),
+            op: CmpOp::Gt,
+            threshold: 0.0,
+        }
+    }
+
+    // A gate-passing validation with a configurable acted-cohort size.
+    fn passing_validation(n_acted: i64) -> ValidationResult {
+        ValidationResult {
+            dsr: 0.5,
+            pbo: 0.1,
+            oos_expectancy_cost_aware: 0.05,
+            profit_factor: 1.4,
+            cvar5: -0.4,
+            mar: 0.5,
+            regime_contrib: BTreeMap::new(),
+            n_regimes_positive: 3,
+            passed_gate: false, // gate is re-derived; metrics above pass independently
+            precision_oos: 0.7,
+            recall_oos: 0.5,
+            act_threshold: 0.6,
+            n_acted_oos: n_acted,
+        }
+    }
+
+    fn evaluated(genome: Genome, validation: &ValidationResult) -> Evaluated {
+        let strategy = Strategy::new(genome);
+        let score = OosScore::from_validation(
+            strategy.id,
+            validation,
+            se_validation::PromotionGate::evaluate(validation),
+            80,
+        );
+        Evaluated {
+            strategy,
+            score: Some(score),
+            n_entries: 80,
+        }
+    }
+
+    #[test]
+    fn regime_only_gate_passer_is_not_promotable() {
+        // Regime-only conjunction: passes the hard gate but has no actionable entry trigger.
+        let genome = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![pred(Layer::Regime), pred(Layer::Tradeability)],
+        );
+        let v = passing_validation(50); // plenty of acted trades, but no trigger/location
+        let ev = evaluated(genome, &v);
+        assert!(ev.score.as_ref().unwrap().passed_gate, "gate must pass");
+        assert!(
+            !ev.promotable(),
+            "regime-only genome must NOT be promotable"
+        );
+        // It is still kept as a survivor (not retired) because the gate passed.
+        assert!(ev.survives());
+    }
+
+    #[test]
+    fn trigger_with_sufficient_acted_is_promotable() {
+        let genome = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![pred(Layer::Regime), pred(Layer::Trigger)],
+        );
+        let v = passing_validation(MIN_ACTED_TO_PROMOTE as i64);
+        let ev = evaluated(genome, &v);
+        assert!(
+            ev.promotable(),
+            "trigger + sufficient n_acted must be promotable"
+        );
+    }
+
+    #[test]
+    fn trigger_with_too_few_acted_is_not_promotable() {
+        // An actionable genome that nonetheless acted on too few OOS trades is held back.
+        let genome = Genome::new(Side::Long, Horizon::Swing, vec![pred(Layer::Trigger)]);
+        let v = passing_validation(MIN_ACTED_TO_PROMOTE as i64 - 1);
+        let ev = evaluated(genome, &v);
+        assert!(ev.score.as_ref().unwrap().passed_gate);
+        assert!(
+            !ev.promotable(),
+            "too few acted OOS trades must block promotion"
+        );
+        assert!(ev.survives(), "but it is still kept as a survivor");
     }
 }

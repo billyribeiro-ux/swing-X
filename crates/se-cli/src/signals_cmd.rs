@@ -23,8 +23,12 @@ pub async fn run_signals(cfg: &AppConfig, horizon: Option<String>, journal: bool
     println!(" se signals │ horizon={}", profile.horizon.as_str());
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    let promoted = load_promoted(&store, profile.horizon.as_str()).await?;
-    println!("promoted strategies for this horizon: {}", promoted.len());
+    let promoted = load_promoted(&store, profile.horizon.as_str(), cfg.scanner).await?;
+    println!(
+        "promoted strategies for this horizon ({}): {}",
+        cfg.scanner.label(),
+        promoted.len()
+    );
     if promoted.is_empty() {
         println!(
             "\nNo promoted strategies for horizon `{}` — nothing to surface.\n\
@@ -35,7 +39,7 @@ pub async fn run_signals(cfg: &AppConfig, horizon: Option<String>, journal: bool
         return Ok(());
     }
 
-    let signals = se_signal::generate_signals(&store, &profile, &cfg.universe).await?;
+    let signals = se_signal::generate_signals(&store, &profile, &cfg.universe, cfg.scanner).await?;
 
     if signals.is_empty() {
         println!(

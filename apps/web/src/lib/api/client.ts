@@ -60,16 +60,22 @@ function settle<T>(value: T): Promise<T> {
   return Promise.resolve(value);
 }
 
+/** Which scanner a request targets. Absent/`'etf'` selects the default ETF scanner. */
+export type Scanner = 'etf' | 'equity';
+
 /**
- * Append a `?from=&to=` window to a path. Only present bounds are emitted so a
- * bare range leaves the path unchanged (and the backend stays unfiltered).
+ * Append the `?from=&to=&scanner=` query to a path. Only present bounds are
+ * emitted, and `scanner` is only emitted when it is the non-default `'equity'`,
+ * so a bare ETF request leaves the path unchanged (backend stays unfiltered and
+ * on the default scanner).
  */
-function withRange(path: string, range?: DateRange): string {
-  if (!range || (!range.from && !range.to)) return path;
+function withParams(path: string, range?: DateRange, scanner?: Scanner): string {
   const params = new URLSearchParams();
-  if (range.from) params.set('from', range.from);
-  if (range.to) params.set('to', range.to);
-  return `${path}?${params.toString()}`;
+  if (range?.from) params.set('from', range.from);
+  if (range?.to) params.set('to', range.to);
+  if (scanner === 'equity') params.set('scanner', scanner);
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
 }
 
 /**
@@ -90,14 +96,15 @@ async function resolve<T extends object>(
   fixture: T[],
   fetchFn: typeof fetch = fetch,
   range?: DateRange,
-  dateKey?: (row: T) => string
+  dateKey?: (row: T) => string,
+  scanner?: Scanner
 ): Promise<T[]> {
   if (!usingLiveApi) {
     const rows = dateKey && range ? filterByRange(fixture, range, dateKey) : fixture;
     return settle(clone(rows));
   }
   try {
-    const raw = await getJson(withRange(path, range), fetchFn);
+    const raw = await getJson(withParams(path, range, scanner), fetchFn);
     return schema.parse(raw);
   } catch (err) {
     console.warn(`[api] falling back to fixtures for ${path}:`, err);
@@ -110,24 +117,33 @@ async function resolve<T extends object>(
 // Public API surface
 // ---------------------------------------------------------------------------
 
-export function getSignals(fetchFn?: typeof fetch, range?: DateRange): Promise<Signal[]> {
+export function getSignals(
+  fetchFn?: typeof fetch,
+  range?: DateRange,
+  scanner?: Scanner
+): Promise<Signal[]> {
   return resolve(
     '/api/signals',
     signalsSchema,
     signalFixtures,
     fetchFn,
     range,
-    (s) => s.decisionTs
+    (s) => s.decisionTs,
+    scanner
   );
 }
 
-export async function getSignal(id: string, fetchFn?: typeof fetch): Promise<Signal | null> {
+export async function getSignal(
+  id: string,
+  fetchFn?: typeof fetch,
+  scanner?: Scanner
+): Promise<Signal | null> {
   if (!usingLiveApi) {
     const found = signalFixtures.find((s) => s.signalId === id) ?? null;
     return settle(found ? clone(found) : null);
   }
   try {
-    const raw = await getJson(`/api/signals/${id}`, fetchFn);
+    const raw = await getJson(withParams(`/api/signals/${id}`, undefined, scanner), fetchFn);
     return signalSchema.parse(raw);
   } catch (err) {
     // Distinguish "backend says 404" from a transient/parse failure: on a 404 the
@@ -141,7 +157,11 @@ export async function getSignal(id: string, fetchFn?: typeof fetch): Promise<Sig
   }
 }
 
-export function getPopulation(fetchFn?: typeof fetch, range?: DateRange): Promise<Strategy[]> {
+export function getPopulation(
+  fetchFn?: typeof fetch,
+  range?: DateRange,
+  scanner?: Scanner
+): Promise<Strategy[]> {
   // Window strategies by their freshness timestamp — the latest OOS score's
   // `evaluatedAt` when present (matching the backend's COALESCE on `created_at`).
   return resolve(
@@ -150,19 +170,41 @@ export function getPopulation(fetchFn?: typeof fetch, range?: DateRange): Promis
     populationFixtures,
     fetchFn,
     range,
-    (s) => s.latestScore?.evaluatedAt ?? ''
+    (s) => s.latestScore?.evaluatedAt ?? '',
+    scanner
   );
 }
 
 export function getMonitorEvents(
   fetchFn?: typeof fetch,
-  range?: DateRange
+  range?: DateRange,
+  scanner?: Scanner
 ): Promise<MonitorEvent[]> {
-  return resolve('/api/monitor', monitorEventsSchema, monitorFixtures, fetchFn, range, (e) => e.ts);
+  return resolve(
+    '/api/monitor',
+    monitorEventsSchema,
+    monitorFixtures,
+    fetchFn,
+    range,
+    (e) => e.ts,
+    scanner
+  );
 }
 
-export function getJournal(fetchFn?: typeof fetch, range?: DateRange): Promise<Trade[]> {
-  return resolve('/api/journal', journalSchema, journalFixtures, fetchFn, range, (t) => t.entryTs);
+export function getJournal(
+  fetchFn?: typeof fetch,
+  range?: DateRange,
+  scanner?: Scanner
+): Promise<Trade[]> {
+  return resolve(
+    '/api/journal',
+    journalSchema,
+    journalFixtures,
+    fetchFn,
+    range,
+    (t) => t.entryTs,
+    scanner
+  );
 }
 
 export function getChangelog(fetchFn?: typeof fetch): Promise<ChangelogWeek[]> {

@@ -289,7 +289,7 @@ mod tests {
 
     fn bar(i: i64, o: f64, h: f64, l: f64, c: f64) -> Bar {
         Bar {
-            ticker: Ticker::Spy,
+            ticker: Ticker::SPY,
             ts: Utc.timestamp_opt(1_600_000_000 + i * 86_400, 0).unwrap(),
             open: o,
             high: h,

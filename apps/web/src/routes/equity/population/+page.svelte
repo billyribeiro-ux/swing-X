@@ -7,6 +7,6 @@
 
 <PopulationView
   population={data.population}
-  title="Strategy Population"
-  subtitle="Evolving genomes ranked by overfit-penalized, cost-aware OOS metrics. Win rate is intentionally omitted — it is a banned selection metric."
+  title="Equity Scanner — Strategy Population"
+  subtitle="Evolving equity genomes ranked by overfit-penalized, cost-aware OOS metrics. Win rate is intentionally omitted — it is a banned selection metric."
 />

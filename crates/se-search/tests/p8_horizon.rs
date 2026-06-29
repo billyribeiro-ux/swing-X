@@ -48,7 +48,7 @@ async fn run_under_profile(
 
     // SPY/QQQ carry the deepest history; build their windows.
     let mut windows = Vec::new();
-    for t in [Ticker::Spy, Ticker::Qqq] {
+    for t in [Ticker::SPY, Ticker::QQQ] {
         let w = build_window(store, t, from, to, profile)
             .await
             .expect("window");

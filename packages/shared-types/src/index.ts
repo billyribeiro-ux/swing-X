@@ -14,7 +14,14 @@
 // Enumerations
 // ---------------------------------------------------------------------------
 
-/** Fixed 10-ticker US equity-index ETF universe. */
+/**
+ * The fixed 10-ticker US equity-index ETF universe, surfaced by the ETF scanner.
+ *
+ * This list is retained for ETF-scoped UI (filters, labels) but is intentionally
+ * NOT used to constrain incoming payloads: the equity scanner surfaces arbitrary
+ * stock symbols (TSLA, AAPL, ...), so a ticker on the wire is an open string. See
+ * {@link Ticker}.
+ */
 export const TICKERS = [
   'SPY',
   'QQQ',
@@ -27,7 +34,16 @@ export const TICKERS = [
   'XLV',
   'XLU',
 ] as const;
-export type Ticker = (typeof TICKERS)[number];
+
+/** A known ETF-universe symbol. Members of {@link TICKERS}. */
+export type EtfTicker = (typeof TICKERS)[number];
+
+/**
+ * A ticker as it appears on the wire. Open universe: the ETF scanner emits members
+ * of {@link TICKERS}, while the equity scanner emits arbitrary stock symbols. Kept
+ * as a plain string so equity payloads validate instead of falling back to fixtures.
+ */
+export type Ticker = string;
 
 export const SIDES = ['long', 'short'] as const;
 export type Side = (typeof SIDES)[number];
@@ -165,6 +181,14 @@ export interface OosScore {
   nRegimesPositive: number;
   /** Whether the strategy cleared the promotion gate. */
   passedGate: boolean;
+  /** OOS precision = P(profit | acted) at the meta-labeling acting threshold τ*. Headline accuracy. */
+  precisionOos?: number;
+  /** OOS recall at τ* — fraction of profitable opportunities captured. */
+  recallOos?: number;
+  /** τ* — the selected acting threshold in [0, 1]. */
+  actThreshold?: number;
+  /** Number of OOS trades acted on at τ* (cohort the precision is measured over). */
+  nActed?: number;
   /** ISO-8601 timestamp of the evaluation. */
   evaluatedAt: string;
 }

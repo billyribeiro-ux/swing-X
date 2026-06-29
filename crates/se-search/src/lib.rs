@@ -42,5 +42,8 @@ pub use population::{
 };
 pub use risk_search::RiskSpace;
 pub use rng::Rng;
-pub use score::{score_oos, OosScore, ScoreConfig, MIN_ENTRIES_TO_VALIDATE};
+pub use score::{
+    genome_has_actionable_predicate, score_oos, OosScore, ScoreConfig, MIN_ACTED_TO_PROMOTE,
+    MIN_ENTRIES_TO_VALIDATE,
+};
 pub use seed::{layer_of_key, random_genome, seed_population, FeatureCatalog, FeatureStat};

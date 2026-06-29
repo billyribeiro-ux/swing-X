@@ -29,7 +29,7 @@ async fn fmp_live_spy_bars_and_vix_quote() {
     let start = end - Duration::days(14);
 
     let bars = provider
-        .daily_bars(Ticker::Spy, start, end)
+        .daily_bars(Ticker::SPY, start, end)
         .await
         .expect("SPY daily_bars live fetch");
 

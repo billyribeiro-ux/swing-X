@@ -18,7 +18,7 @@ pub mod conviction;
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use se_core::{Driver, HorizonProfile, Result, Side, Signal, Strategy, Ticker};
+use se_core::{Driver, HorizonProfile, Result, Scanner, Side, Signal, Strategy, Ticker};
 use se_features::indicators::atr;
 use se_features::{
     EventOverlay, FeatureContext, FeatureModule, LocationModule, RegimeModule, TradeabilityModule,
@@ -27,12 +27,22 @@ use se_features::{
 use se_provider::NullProprietary;
 use se_regime::RegimeClassifier;
 use se_search::persist::{latest_oos_score, load_promoted, StoredOosScore};
+use se_search::MIN_ACTED_TO_PROMOTE;
 use se_store::Store;
 
-use crate::conviction::from_cohort;
+use crate::conviction::{from_cohort, from_oos_precision};
+
+/// Live defence-in-depth precision floor: never surface a single-name signal whose strategy's
+/// validated OUT-OF-SAMPLE precision (P(profit | acted) at τ\*) is below this, even though
+/// promotion already optimized the acting threshold for cost-aware OOS expectancy. Low-precision
+/// fades are the most fragile to single-name earnings/gap risk, so we hold the live bar higher
+/// than the search's promote bar. Only applied when the validator measured precision over a
+/// non-trivial acted cohort (`n_acted >= MIN_ACTED_TO_PROMOTE`); legacy scores (NULL precision)
+/// fall back to the cohort-implied conviction and are unaffected.
+pub const MIN_LIVE_PRECISION: f64 = 0.40;
 
 /// Reasons a promoted strategy did not produce a signal at the latest bar (for reporting).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NoSignal {
     NoBars,
     NotFiring,
@@ -40,6 +50,10 @@ pub enum NoSignal {
     NoAtr,
     NoOosScore,
     GeometryRefused(String),
+    /// An earnings release falls inside the would-be holding window (single-name gap risk).
+    EarningsBlackout(chrono::NaiveDate),
+    /// The strategy's validated OOS precision (P(profit | acted)) is below the live floor.
+    LowPrecision(f64),
 }
 
 impl std::fmt::Display for NoSignal {
@@ -51,8 +65,44 @@ impl std::fmt::Display for NoSignal {
             NoSignal::NoAtr => write!(f, "insufficient history for ATR"),
             NoSignal::NoOosScore => write!(f, "no persisted OOS score for the strategy"),
             NoSignal::GeometryRefused(why) => write!(f, "signal refused: {why}"),
+            NoSignal::EarningsBlackout(d) => {
+                write!(f, "earnings blackout (release {d} inside holding window)")
+            }
+            NoSignal::LowPrecision(p) => {
+                write!(
+                    f,
+                    "validated OOS precision {p:.3} below live floor {MIN_LIVE_PRECISION:.2}"
+                )
+            }
         }
     }
+}
+
+/// Is there an earnings release inside the would-be holding window? Returns the offending date if
+/// so. The window is the horizon's max holding period converted from trading bars to calendar days
+/// (`bars × 7 ÷ 5`, ceil). ETFs have no earnings rows, so this is a no-op for the ETF scanner.
+async fn earnings_in_holding_window(
+    store: &Store,
+    ticker: Ticker,
+    decision_ts: DateTime<Utc>,
+    profile: &HorizonProfile,
+) -> Result<Option<chrono::NaiveDate>> {
+    let decision_date = decision_ts.date_naive();
+    // Trading bars -> calendar days (ceil of bars × 7/5), at least 1.
+    let blackout_days = ((profile.max_hold_bars as i64 * 7) + 4) / 5;
+    let blackout_days = blackout_days.max(1);
+    let until = decision_date + chrono::Duration::days(blackout_days);
+    let row: Option<(chrono::NaiveDate,)> = se_store::sqlx::query_as(
+        "SELECT date FROM earnings WHERE ticker = $1 AND date > $2 AND date <= $3 \
+         ORDER BY date ASC LIMIT 1",
+    )
+    .bind(ticker.as_str())
+    .bind(decision_date)
+    .bind(until)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|e| se_core::Error::Store(e.to_string()))?;
+    Ok(row.map(|(d,)| d))
 }
 
 /// The outcome of attempting to build a signal for one strategy at one ticker.
@@ -166,6 +216,12 @@ pub async fn build_signal_for(
         return Ok(SignalAttempt::Skipped(NoSignal::RegimeNotTradeable));
     }
 
+    // Earnings blackout: never open a new position into a release inside the holding window
+    // (single-name gap risk that the stop can't honor). No-op for ETFs (no earnings rows).
+    if let Some(d) = earnings_in_holding_window(store, ticker, bar.ts, profile).await? {
+        return Ok(SignalAttempt::Skipped(NoSignal::EarningsBlackout(d)));
+    }
+
     let Some(atr_val) = atr_opt else {
         return Ok(SignalAttempt::Skipped(NoSignal::NoAtr));
     };
@@ -174,6 +230,15 @@ pub async fn build_signal_for(
     let Some(score) = latest_oos_score(store, strategy.id).await? else {
         return Ok(SignalAttempt::Skipped(NoSignal::NoOosScore));
     };
+
+    // Live precision floor (defence-in-depth): when the validator measured this strategy's OOS
+    // precision (P(profit | acted) at τ*) over a non-trivial acted cohort, hold the live single-
+    // name bar above the search's promote bar. Legacy scores (NULL precision) skip this check.
+    if let (Some(p), Some(n)) = (score.precision_oos, score.n_acted) {
+        if n as usize >= MIN_ACTED_TO_PROMOTE && p < MIN_LIVE_PRECISION {
+            return Ok(SignalAttempt::Skipped(NoSignal::LowPrecision(p)));
+        }
+    }
 
     let side = strategy.genome.side;
     let entry = bar.close;
@@ -189,12 +254,22 @@ pub async fn build_signal_for(
     } else {
         0.0
     };
-    let conviction = from_cohort(score_expectancy(&score), rr1);
+    // Conviction: prefer the strategy's OUT-OF-SAMPLE measured precision at the meta-labeling
+    // acting threshold τ* (a directly-measured P(profit | acted)) over the expectancy-implied
+    // cohort proxy — but only when measured over a non-trivial acted cohort.
+    let conviction = match (score.precision_oos, score.n_acted) {
+        (Some(p), Some(n)) if n as usize >= MIN_ACTED_TO_PROMOTE => from_oos_precision(p, n),
+        _ => from_cohort(score_expectancy(&score), rr1),
+    };
 
     let drivers = drivers_for(&strategy.genome, &features);
     let invalidation = invalidation_rule(side, stop);
     let cohort_n = score_cohort_n(&score);
-    let lead_time = format!("next-bar-open fill; conviction {} ", conviction.label);
+    let tau = score.act_threshold.unwrap_or(0.5);
+    let lead_time = format!(
+        "next-bar-open fill; conviction {} (acting τ*={tau:.2})",
+        conviction.label
+    );
 
     match Signal::new(
         strategy.id,
@@ -240,15 +315,16 @@ pub async fn generate_signals(
     store: &Store,
     profile: &HorizonProfile,
     universe: &[Ticker],
+    scanner: Scanner,
 ) -> Result<Vec<Signal>> {
-    let promoted = load_promoted(store, profile.horizon.as_str()).await?;
+    let promoted = load_promoted(store, profile.horizon.as_str(), scanner).await?;
     let mut out = Vec::new();
     for strategy in &promoted {
         for &ticker in universe {
             match build_signal_for(store, strategy, ticker, profile).await? {
                 SignalAttempt::Emitted(sig) => {
                     let sig = *sig;
-                    persist_signal(store, &sig).await?;
+                    persist_signal(store, &sig, scanner).await?;
                     out.push(sig);
                 }
                 SignalAttempt::Skipped(reason) => {
@@ -261,7 +337,7 @@ pub async fn generate_signals(
 }
 
 /// Persist one signal to the `signals` table (idempotent on `signal_id`).
-pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
+pub async fn persist_signal(store: &Store, sig: &Signal, scanner: Scanner) -> Result<()> {
     let why_json =
         serde_json::to_value(&sig.why).map_err(|e| se_core::Error::Store(e.to_string()))?;
     let payload_json =
@@ -276,8 +352,9 @@ pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
         "INSERT INTO signals \
             (signal_id, strategy_id, ticker, side, decision_ts, horizon, entry, stop, \
              target1, target2, rr1, rr2, conviction, cohort_n, regime_desc, why, invalidation, \
-             cohort_expectancy, cvar5, lead_time, payload_json, payload_human) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) \
+             cohort_expectancy, cvar5, lead_time, payload_json, payload_human, scanner) \
+         VALUES \
+            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) \
          ON CONFLICT (signal_id) DO NOTHING",
     )
     .bind(sig.id.inner())
@@ -302,6 +379,7 @@ pub async fn persist_signal(store: &Store, sig: &Signal) -> Result<()> {
     .bind(&sig.lead_time)
     .bind(payload_json)
     .bind(payload_human)
+    .bind(scanner.as_str())
     .execute(store.pool())
     .await
     .map_err(|e| se_core::Error::Store(e.to_string()))?;
@@ -386,7 +464,7 @@ mod tests {
         // Signal::new must accept this geometry (directionally consistent).
         let sig = Signal::new(
             StrategyId::new(),
-            Ticker::Spy,
+            Ticker::SPY,
             g.side,
             se_core::DecisionTs::new(Utc::now()),
             g.horizon,

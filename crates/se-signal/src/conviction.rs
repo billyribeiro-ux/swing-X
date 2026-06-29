@@ -34,6 +34,28 @@ pub fn from_cohort(oos_expectancy_r: f64, rr: f64) -> Conviction {
     }
 }
 
+/// Derive conviction from the strategy's OUT-OF-SAMPLE measured precision at the meta-labeling
+/// acting threshold τ\* — i.e. `P(profit | acted)` realized on the held-out OOS reporting half
+/// during validation. Unlike [`from_cohort`], this is a directly-measured probability of a
+/// profitable trade for this strategy's acting regime (not an expectancy-implied proxy), so it is
+/// the honest conviction whenever the validator produced it over a non-trivial acted cohort.
+///
+/// `precision` is clamped to `[0, 1]`; `n_acted` is the OOS acted cohort size the precision was
+/// measured over (surfaced in the label so a reader can weigh the estimate's reliability).
+pub fn from_oos_precision(precision: f64, n_acted: i64) -> Conviction {
+    let value = if precision.is_finite() {
+        precision.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Conviction {
+        value,
+        label: format!(
+            "OOS-measured precision at τ* (P(profit|acted) on held-out OOS, n_acted={n_acted})"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +82,19 @@ mod tests {
         assert_eq!(from_cohort(-5.0, 2.0).value, 0.0); // clamps low
                                                        // rr <= 0 falls back to 1.0 -> p = (0+1)/2 = 0.5.
         assert!((from_cohort(0.0, -1.0).value - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn oos_precision_is_the_measured_probability() {
+        // The OOS-precision conviction passes the measured probability straight through (clamped)
+        // and labels itself as a held-out measurement, not a proxy.
+        let c = from_oos_precision(0.62, 41);
+        assert!((c.value - 0.62).abs() < 1e-9);
+        assert!(c.label.contains("OOS-measured precision"));
+        assert!(c.label.contains("n_acted=41"));
+        // Clamps out-of-range / non-finite inputs.
+        assert_eq!(from_oos_precision(1.5, 10).value, 1.0);
+        assert_eq!(from_oos_precision(-0.2, 10).value, 0.0);
+        assert_eq!(from_oos_precision(f64::NAN, 10).value, 0.0);
     }
 }
