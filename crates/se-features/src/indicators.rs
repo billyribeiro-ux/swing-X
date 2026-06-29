@@ -189,6 +189,28 @@ pub fn rsi(closes: &[f64], period: usize) -> Option<f64> {
     Some(100.0 - 100.0 / (1.0 + rs))
 }
 
+/// Change in Wilder's RSI(`period`) over the last `k` closes: the RSI computed at
+/// the latest close minus the RSI computed `k` closes earlier (i.e. on the series
+/// truncated by `k` bars). Positive = momentum strengthening, negative = fading.
+///
+/// Reads only the supplied (PIT-clean, oldest-first) closes: the "earlier" RSI is
+/// taken on a STRICT PREFIX `closes[..len-k]`, so it can never see a bar newer than
+/// the latest close. `None` if either RSI can't be formed (`len <= period + k`).
+pub fn rsi_slope(closes: &[f64], period: usize, k: usize) -> Option<f64> {
+    if k == 0 {
+        return None;
+    }
+    let len = closes.len();
+    // Need `period + 1` closes for the latest RSI and the same for the lagged one,
+    // which sits on a prefix shortened by `k` bars.
+    if len <= period + k {
+        return None;
+    }
+    let now = rsi(closes, period)?;
+    let prev = rsi(&closes[..len - k], period)?;
+    Some(now - prev)
+}
+
 /// N-bar rate of change of a close series: `last / close[n-back] - 1`.
 /// `None` if there aren't `n + 1` closes or the reference close is zero.
 pub fn roc(closes: &[f64], n: usize) -> Option<f64> {
@@ -354,6 +376,48 @@ mod tests {
         // 1-back ROC: 110/99 - 1 > 0.
         assert!(roc(&closes, 1).unwrap() > 0.0);
         assert_eq!(roc(&closes, 4), None);
+    }
+
+    #[test]
+    fn rsi_slope_sign_and_guards() {
+        // A series that accelerates upward late: RSI(period) at the end should be
+        // >= RSI(period) k bars earlier -> non-negative slope. Use a mild then
+        // steeper ramp so the recent window has stronger average gains.
+        let mut closes: Vec<f64> = Vec::new();
+        let mut p = 100.0;
+        for _ in 0..30 {
+            p += 0.2; // mild early uptrend
+            closes.push(p);
+        }
+        for _ in 0..10 {
+            p += 1.0; // accelerating finish
+            closes.push(p);
+        }
+        let s = rsi_slope(&closes, 14, 5).expect("enough closes");
+        assert!(s >= 0.0, "accelerating uptrend -> RSI slope >= 0, got {s}");
+
+        // Decelerating finish: a strong early ramp that flattens -> RSI fades ->
+        // non-positive slope.
+        let mut closes2: Vec<f64> = Vec::new();
+        let mut q = 100.0;
+        for _ in 0..30 {
+            q += 1.0; // strong early uptrend
+            closes2.push(q);
+        }
+        for _ in 0..10 {
+            q += 0.05; // flattening finish
+            closes2.push(q);
+        }
+        let s2 = rsi_slope(&closes2, 14, 5).expect("enough closes");
+        assert!(
+            s2 <= 0.0,
+            "decelerating uptrend -> RSI slope <= 0, got {s2}"
+        );
+
+        // Guards: k = 0 -> None; too few closes -> None.
+        assert_eq!(rsi_slope(&closes, 14, 0), None);
+        let short: Vec<f64> = (0..16).map(|i| 100.0 + i as f64).collect();
+        assert_eq!(rsi_slope(&short, 14, 5), None);
     }
 
     #[test]

@@ -79,11 +79,16 @@ async fn p3_layers_produce_finite_features() {
     let loc_keys: Vec<&str> = loc.iter().map(|f| f.key.as_str()).collect();
     assert!(loc_keys.contains(&"location.dist_50dma"));
     assert!(loc_keys.contains(&"location.pct_range_position"));
+    assert!(loc_keys.contains(&"location.dist_rolling_high"));
+    assert!(loc_keys.contains(&"location.dist_rolling_low"));
 
     let trig_keys: Vec<&str> = trig.iter().map(|f| f.key.as_str()).collect();
     assert!(trig_keys.contains(&"trigger.rs_vs_spy"));
     assert!(trig_keys.contains(&"trigger.breadth_thrust"));
     assert!(trig_keys.contains(&"trigger.rsi14"));
+    assert!(trig_keys.contains(&"trigger.rsi_slope"));
+    assert!(trig_keys.contains(&"trigger.ema_stack_align"));
+    assert!(trig_keys.contains(&"trigger.atr_pct"));
 
     let evt_keys: Vec<&str> = evt.iter().map(|f| f.key.as_str()).collect();
     assert!(evt_keys.contains(&"event.is_opex"));

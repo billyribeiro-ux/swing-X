@@ -96,10 +96,25 @@ pub struct SearchConfig {
     /// Which scanner this population belongs to (ETF vs equity). Tags every persisted strategy so
     /// the two populations stay separate on the scoreboard, in the journal, and in promotion.
     pub scanner: Scanner,
+    /// Exploration breadth knob: how many DISTINCT candidate genomes to generate per generation
+    /// before scoring, as a multiple of `per_gen`. The generation builds this larger, more diverse
+    /// pool (extra survivor mutations + a bigger fresh-seed draw) and then keeps the first `per_gen`
+    /// distinct ones — so widening this only changes which candidates are explored, never how many
+    /// are scored (`per_gen` is unchanged) and never the survivor/ranking/gate logic.
+    ///
+    /// Defaults to [`DEFAULT_OFFSPRING_POOL_MULT`]. Backward-compatible: callers that construct via
+    /// [`SearchConfig::new`] get the default automatically; values `<= 1.0` reproduce the legacy
+    /// (per_gen-sized) pool.
+    pub offspring_pool_mult: f64,
 }
 
 /// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
 pub const DEFAULT_SEARCH_SEED: u64 = 0x0005_EED0_F5EA_C401;
+
+/// Default exploration-pool multiple (see [`SearchConfig::offspring_pool_mult`]). Modestly larger
+/// than 1 so each generation considers a richer, more diverse candidate pool before keeping the
+/// best `per_gen` distinct ones — better exploration at no extra scoring cost.
+pub const DEFAULT_OFFSPRING_POOL_MULT: f64 = 2.0;
 
 impl SearchConfig {
     pub fn new(profile: HorizonProfile, universe: Vec<Ticker>) -> Self {
@@ -119,6 +134,7 @@ impl SearchConfig {
             risk: RiskModel::from_profile(&profile),
             lock_risk: false,
             scanner: Scanner::Etf,
+            offspring_pool_mult: DEFAULT_OFFSPRING_POOL_MULT,
         }
     }
 }
@@ -317,9 +333,22 @@ impl<'a> PopulationManager<'a> {
     }
 
     /// Assemble the next generation's genomes from survivors + fresh seeds.
+    ///
+    /// Exploration breadth: candidates are drawn from a pool of up to `per_gen *
+    /// offspring_pool_mult` distinct genomes (elite survivors first, then several mutations per
+    /// survivor, then crossovers, then a larger fresh-seed draw) and the first `per_gen` distinct
+    /// ones are kept. Widening `offspring_pool_mult` changes only which candidates fill the
+    /// non-elite slots — the number scored stays `per_gen`, and survivors are always carried
+    /// forward first (unchanged elitism). This never touches the survivor/ranking/gate logic.
     fn next_generation(&self, survivors: &[Genome], per_gen: usize, rng: &mut Rng) -> Vec<Genome> {
         let mut genomes: Vec<Genome> = Vec::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // The richer candidate pool we draw from before truncating to `per_gen`. `>= per_gen` so a
+        // multiple of 1 (or less) reproduces the legacy per_gen-sized behavior.
+        let pool_target =
+            ((per_gen as f64) * self.cfg.offspring_pool_mult.max(1.0)).ceil() as usize;
+        let pool_target = pool_target.max(per_gen);
 
         let push =
             |g: Genome, seen: &mut std::collections::BTreeSet<String>, out: &mut Vec<Genome>| {
@@ -333,6 +362,8 @@ impl<'a> PopulationManager<'a> {
         for g in survivors {
             push(g.clone(), &mut seen, &mut genomes);
         }
+        // One guaranteed mutation per survivor first (preserves prior behavior for the head of the
+        // list), capped at `per_gen` so elitism + first mutations are unchanged from before.
         for g in survivors {
             if genomes.len() >= per_gen {
                 break;
@@ -360,9 +391,30 @@ impl<'a> PopulationManager<'a> {
             }
         }
 
-        // Top up with fresh seeds, each given a sampled (or locked) risk geometry.
-        if genomes.len() < per_gen {
-            let need = per_gen - genomes.len();
+        // EXPLORATION: extra mutations of survivors to enrich the pool beyond `per_gen` (only used
+        // to widen diversity before truncation; does not displace the elite head above). We fill
+        // the extra mutations up to the MIDPOINT between `per_gen` and `pool_target`, reserving the
+        // rest of the pool for fresh seeds so both intensification (mutations) and diversification
+        // (fresh seeds) stay represented.
+        let mut_target = per_gen + (pool_target - per_gen) / 2;
+        if !survivors.is_empty() && mut_target > genomes.len() {
+            let mut guard = 0usize;
+            let max_attempts = pool_target.saturating_mul(4).max(8);
+            while genomes.len() < mut_target && guard < max_attempts {
+                guard += 1;
+                let parent = &survivors[rng.below(survivors.len())];
+                let mut m = genome_ops::mutate(parent, &self.catalog, rng);
+                if !self.cfg.lock_risk {
+                    m.risk = self.risk_space.mutate(&parent.risk, rng);
+                }
+                push(m, &mut seen, &mut genomes);
+            }
+        }
+
+        // Top up with fresh seeds, each given a sampled (or locked) risk geometry. Draw enough to
+        // fill the richer pool, then truncate to `per_gen` below.
+        if genomes.len() < pool_target {
+            let need = pool_target - genomes.len();
             let fresh = seed_population(
                 &self.catalog,
                 self.cfg.profile.horizon,
@@ -371,7 +423,7 @@ impl<'a> PopulationManager<'a> {
                 self.cfg.max_predicates,
             );
             for g in fresh {
-                if genomes.len() >= per_gen {
+                if genomes.len() >= pool_target {
                     break;
                 }
                 push(self.assign_seed_risk(g, rng), &mut seen, &mut genomes);
@@ -487,6 +539,15 @@ mod tests {
             score: Some(score),
             n_entries: 80,
         }
+    }
+
+    #[test]
+    fn search_config_default_sets_offspring_pool_mult() {
+        // Backward-compatible default: callers via `new()` get the exploration pool multiple
+        // without having to set it, and it is > 1 so each generation explores a richer pool.
+        let cfg = SearchConfig::new(se_core::HorizonProfile::swing(), vec![Ticker::SPY]);
+        assert_eq!(cfg.offspring_pool_mult, DEFAULT_OFFSPRING_POOL_MULT);
+        assert!(cfg.offspring_pool_mult >= 1.0);
     }
 
     #[test]

@@ -199,53 +199,150 @@ def _oos_returns_for_trial(
     return np.where(acted, y_np, 0.0)
 
 
+def _candidate_grid(proba: np.ndarray) -> np.ndarray:
+    """Deterministic candidate threshold grid: proba deciles ∪ coarse linspace.
+
+    The grid is the unique data quantile deciles of ``proba`` plus a coarse linspace over
+    [0.30, 0.90] (deduplicated, sorted ascending). Deterministic given ``proba``.
+    """
+    deciles = np.quantile(proba, np.linspace(0.0, 0.9, 10))
+    coarse = np.linspace(0.30, 0.90, 7)
+    return np.unique(np.concatenate([deciles, coarse]))
+
+
+def _threshold_stats(
+    proba: np.ndarray,
+    r: np.ndarray,
+    tau: float,
+    cost: float,
+) -> tuple[int, float, float, float]:
+    """Acting stats for ``tau`` on one (proba, r) fold.
+
+    Returns ``(n_acted, precision, recall, expectancy)`` where precision is the fraction of
+    acted rows that are profitable (``make_meta_labels`` R > 0), recall is
+    #acted-and-profitable / #profitable, and expectancy is the cost-aware mean R over acted
+    rows (``-inf`` when nothing acted, so it never beats a real candidate on tie-breaks).
+    """
+    labels = make_meta_labels(r)
+    n_profit = int(labels.sum())
+    acted = proba >= tau
+    n_acted = int(acted.sum())
+    if n_acted == 0:
+        return 0, 0.0, 0.0, -np.inf
+    acted_profit = int((acted & (labels == 1)).sum())
+    precision = acted_profit / n_acted
+    recall = (acted_profit / n_profit) if n_profit > 0 else 0.0
+    expectancy = float(np.mean(mx.cost_aware_returns(r[acted], cost)))
+    return n_acted, float(precision), float(recall), expectancy
+
+
+def _passes_constraints(
+    proba: np.ndarray,
+    r: np.ndarray,
+    tau: float,
+    cost: float,
+    min_acted: int,
+    require_recall: bool,
+) -> bool:
+    """Whether ``tau`` clears the acting constraints on one fold.
+
+    Constraints: cost-aware expectancy strictly > 0, n_acted >= ``min_acted``, and (only when
+    ``require_recall``) IS recall >= 0.10. The recall floor is checked on the primary
+    (selection) fold; the secondary robustness fold only re-checks expectancy + min acted.
+    """
+    n_acted, _prec, recall, expectancy = _threshold_stats(proba, r, tau, cost)
+    if n_acted < min_acted or expectancy <= 0.0:
+        return False
+    return not (require_recall and recall < 0.10)
+
+
+def _rank_precision_first(
+    proba: np.ndarray,
+    r: np.ndarray,
+    grid: np.ndarray,
+    cost: float,
+    min_acted: int,
+) -> list[float]:
+    """Candidate thresholds that clear the constraints, best-first (precision-first).
+
+    A candidate qualifies only if it clears ALL of: cost-aware expectancy > 0,
+    n_acted >= ``min_acted``, IS recall >= 0.10. Qualifying candidates are ranked by:
+    (1) higher in-sample precision, (2) higher cost-aware expectancy, (3) lower threshold
+    (more coverage). Returns the ordered tau list (empty if none qualify). Deterministic.
+    """
+    scored: list[tuple[float, float, float, float]] = []
+    for tau in grid:
+        n_acted, precision, recall, expectancy = _threshold_stats(proba, r, float(tau), cost)
+        if n_acted < min_acted or expectancy <= 0.0 or recall < 0.10:
+            continue
+        # Sort key: precision desc, expectancy desc, tau asc. Negate the descending fields.
+        scored.append((-precision, -expectancy, float(tau), float(tau)))
+    scored.sort()
+    return [tau for _np, _ne, _t, tau in scored]
+
+
 def select_act_threshold(
     proba_is: np.ndarray,
     r_is: np.ndarray,
     cost: float,
 ) -> float:
-    """Select the acting threshold tau* on the in-sample half only (no OOS peeking).
+    """Select the PRECISION-FIRST acting threshold tau* on the in-sample half (no OOS peeking).
 
     ``proba_is`` and ``r_is`` are the FINITE-proba IS-half probability and realized-R arrays
-    (same length, already masked to rows that appeared in a test fold). tau* maximizes
-    cost-aware expectancy ``mean(cost_aware_returns(R[acted], cost))`` over IS-half acted rows
-    (acted = proba >= tau), subject to:
+    (same length, already masked to rows that appeared in a test fold). tau* MAXIMIZES
+    in-sample PRECISION — the fraction of acted IS rows that are profitable
+    (``make_meta_labels`` R > 0, acted = proba >= tau) — subject to ALL of:
 
+      * cost-aware IS expectancy strictly > 0 (never trade a precise-but-unprofitable tau),
       * number of acted rows >= ``max(8, ceil(0.10 * n_is_finite))``, and
-      * IS-half recall >= 0.10  (recall = #acted-and-profitable / #profitable).
+      * IS recall >= 0.10  (recall = #acted-and-profitable / #profitable).
+
+    Ties in precision are broken by higher cost-aware expectancy, then by lower threshold
+    (more coverage).
+
+    ROBUSTNESS (anti threshold-overfit): the IS half is split into two deterministic
+    sub-folds by index — first 70% (selection) and last 30% (confirmation). Candidates are
+    ranked precision-first on the FIRST sub-fold; the chosen tau* is the best-ranked one that
+    ALSO clears the constraints (expectancy > 0, n_acted >= min on that sub-fold) on the
+    SECOND sub-fold. We walk down the ranked list until one holds on BOTH sub-folds. This
+    rejects a tau that only looks precise on a sliver of the IS half.
 
     The candidate grid is the unique IS-half proba deciles plus a coarse linspace over
-    [0.30, 0.90] (deduplicated, sorted). If NO candidate satisfies the constraints, falls
-    back to ``0.5`` — preserving the legacy proba >= 0.5 behavior. Deterministic given inputs.
+    [0.30, 0.90] (deduplicated, sorted). If NO candidate satisfies the constraints on both
+    sub-folds, falls back to ``0.5`` — preserving the legacy proba >= 0.5 behavior.
+    Deterministic given inputs.
     """
     n_is_finite = int(proba_is.size)
     if n_is_finite == 0:
         return 0.5
-    min_acted = max(8, int(np.ceil(0.10 * n_is_finite)))
-    labels = make_meta_labels(r_is)  # 1 where realized R > 0 (profitable), else 0
-    n_profit = int(labels.sum())
 
-    deciles = np.quantile(proba_is, np.linspace(0.0, 0.9, 10))
-    coarse = np.linspace(0.30, 0.90, 7)
-    grid = np.unique(np.concatenate([deciles, coarse]))
+    grid = _candidate_grid(proba_is)
 
-    best_tau = 0.5
-    best_score = -np.inf
-    found = False
-    for tau in grid:
-        acted = proba_is >= tau
-        n_acted = int(acted.sum())
-        if n_acted < min_acted:
-            continue
-        recall = (int((acted & (labels == 1)).sum()) / n_profit) if n_profit > 0 else 0.0
-        if recall < 0.10:
-            continue
-        score = float(np.mean(mx.cost_aware_returns(r_is[acted], cost)))
-        if score > best_score:
-            best_score = score
-            best_tau = float(tau)
-            found = True
-    return best_tau if found else 0.5
+    # Deterministic 70/30 split of the IS half by index.
+    cut = int(np.floor(0.70 * n_is_finite))
+    proba_a, r_a = proba_is[:cut], r_is[:cut]
+    proba_b, r_b = proba_is[cut:], r_is[cut:]
+
+    # If a sub-fold is too small to be meaningful, fall back to single-fold selection over
+    # the whole IS half (still precision-first under the same constraints).
+    if proba_a.size == 0 or proba_b.size == 0:
+        min_acted = max(8, int(np.ceil(0.10 * n_is_finite)))
+        ranked = _rank_precision_first(proba_is, r_is, grid, cost, min_acted)
+        return ranked[0] if ranked else 0.5
+
+    min_acted_a = max(8, int(np.ceil(0.10 * proba_a.size)))
+    # Min-acted floor on the (smaller) confirmation fold scales with its own size.
+    min_acted_b = max(8, int(np.ceil(0.10 * proba_b.size)))
+
+    # Rank precision-first on the selection sub-fold, then require each candidate also holds
+    # (expectancy > 0, min acted) on the confirmation sub-fold; take the first that does.
+    ranked = _rank_precision_first(proba_a, r_a, grid, cost, min_acted_a)
+    for tau in ranked:
+        if _passes_constraints(
+            proba_b, r_b, tau, cost, min_acted_b, require_recall=False
+        ):
+            return tau
+    return 0.5
 
 
 def precision_recall_at(
@@ -286,10 +383,11 @@ def validate(req: ValidateRequest) -> ValidateResult:
     config a naive search would promote — so the gate judges what would actually ship.
 
     On top of the selected config we add a precision-optimized meta-labeling acting layer:
-    an acting threshold tau* is chosen on the IS half (maximizing cost-aware expectancy under
-    coverage constraints — see :func:`select_act_threshold`), and the gate's OOS metrics plus
-    the reported out-of-sample precision/recall are measured on the tau*-acted OOS rows. Win
-    rate is never computed; precision is the north-star OOS metric.
+    an acting threshold tau* is chosen on the IS half (maximizing IS precision under a
+    profitability + coverage + recall constraint set, confirmed on a second IS sub-fold for
+    robustness — see :func:`select_act_threshold`), and the gate's OOS metrics plus the
+    reported out-of-sample precision/recall are measured on the tau*-acted OOS rows. Win rate
+    is never computed; precision is the north-star OOS metric.
     """
     from .cv.cpcv import cpcv_splits  # local import keeps server import light
 
@@ -338,8 +436,9 @@ def validate(req: ValidateRequest) -> ValidateResult:
     is_mask = (idx < mid) & finite
     oos_mask = (idx >= mid) & finite
 
-    # Select tau* on the IS half only (no peeking at OOS), maximizing cost-aware expectancy
-    # subject to coverage constraints; falls back to 0.5 if nothing qualifies.
+    # Select tau* on the IS half only (no peeking at OOS), maximizing IS precision subject to
+    # profitability + coverage + recall constraints (two-sub-fold confirmed for robustness);
+    # falls back to 0.5 if nothing qualifies.
     act_threshold = select_act_threshold(
         proba[is_mask], y_np[is_mask], DEFAULT_COST_PER_TRADE_R
     )

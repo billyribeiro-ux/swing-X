@@ -32,6 +32,8 @@ const RANGE_WINDOW: usize = 20;
 const PIVOT_K: usize = 3;
 /// N-bar range window for prior-week extremes (a trading week = 5 sessions).
 const WEEK_BARS: usize = 5;
+/// Rolling Donchian window (bars) for the N-bar high/low exhaustion distances.
+const ROLLING_WINDOW: usize = 20;
 
 /// The Layer-2 location feature module.
 #[derive(Debug, Clone, Copy, Default)]
@@ -98,6 +100,24 @@ fn anchored_vwap(bars: &[Bar]) -> Option<f64> {
         return None;
     }
     Some(pv / vol)
+}
+
+/// Rolling (Donchian) high and low of the last `window` bars: the max `high` and
+/// min `low` over the window ending at the decision bar (the decision bar itself is
+/// included — these are extremes KNOWN AT the decision bar, not future ones).
+/// `None` if there are no bars to scan.
+fn rolling_high_low(bars: &[Bar], window: usize) -> Option<(f64, f64)> {
+    if bars.is_empty() {
+        return None;
+    }
+    let slice = &bars[bars.len().saturating_sub(window)..];
+    let hi = slice.iter().fold(f64::MIN, |m, b| m.max(b.high));
+    let lo = slice.iter().fold(f64::MAX, |m, b| m.min(b.low));
+    if hi.is_finite() && lo.is_finite() {
+        Some((hi, lo))
+    } else {
+        None
+    }
 }
 
 /// Where `close` sits in the `[low, high]` range of the last `window` bars, in
@@ -222,6 +242,21 @@ impl FeatureModule for LocationModule {
             push(&mut out, "location.pct_range_position", p);
         }
 
+        // --- Distance to the rolling N-bar (Donchian) high / low, ATR units ---
+        // Mean-reversion / exhaustion context: how far the close sits above the
+        // rolling low and below the rolling high. The window ends at the decision
+        // bar (inclusive), so the extremes are known AT that bar — never future.
+        if let Some(a) = atr_v {
+            if let Some((hi, lo)) = rolling_high_low(&bars, ROLLING_WINDOW) {
+                if let Some(d) = atr_dist(close, hi, a) {
+                    push(&mut out, "location.dist_rolling_high", d);
+                }
+                if let Some(d) = atr_dist(close, lo, a) {
+                    push(&mut out, "location.dist_rolling_low", d);
+                }
+            }
+        }
+
         // --- Volume profile / GEX walls / max-pain -----------------------
         // PROPRIETARY/intraday — unavailable in v1. POC/VAH/VAL/HVN/LVN need
         // intraday volume-at-price; call/put walls + max-pain need the options
@@ -279,6 +314,29 @@ mod tests {
         assert_eq!(last_swing_high(&bars, 2), Some(110.0));
         // Most recent confirmed pivot low (k=2) is 90 at index 7.
         assert_eq!(last_swing_low(&bars, 2), Some(90.0));
+    }
+
+    #[test]
+    fn rolling_high_low_window() {
+        // Highs/lows over 6 bars; with window=4 only the last 4 bars count.
+        let bars: Vec<Bar> = [
+            (110.0, 90.0),
+            (130.0, 70.0), // extreme outside the last-4 window
+            (115.0, 95.0),
+            (112.0, 96.0),
+            (118.0, 93.0),
+            (116.0, 94.0),
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, &(h, l))| bar(i as i64, l, h, l, (h + l) / 2.0, 1.0))
+        .collect();
+        // Last 4 bars: highs {115,112,118,116} -> 118; lows {95,96,93,94} -> 93.
+        assert_eq!(rolling_high_low(&bars, 4), Some((118.0, 93.0)));
+        // Full window picks up the wide bar.
+        assert_eq!(rolling_high_low(&bars, 6), Some((130.0, 70.0)));
+        // No bars -> None.
+        assert_eq!(rolling_high_low(&[], 4), None);
     }
 
     #[test]
