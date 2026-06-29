@@ -34,7 +34,9 @@ POST /validate
        {"dsr": 0.61, "pbo": 0.08, "oos_expectancy_cost_aware": 0.04,
         "profit_factor": 1.35, "cvar5": -0.7, "mar": 1.2,
         "regime_contrib": {"bull": 0.06, "bear": 0.01, "chop": 0.03},
-        "n_regimes_positive": 3, "passed_gate": true}
+        "n_regimes_positive": 3, "passed_gate": true,
+        "precision_oos": 0.58, "recall_oos": 0.41,
+        "act_threshold": 0.62, "n_acted_oos": 73}
 
 POST /calibrate
     CalibrateRequest:
@@ -128,6 +130,20 @@ class ValidateResult(_Strict):
     regime_contrib: dict[str, float]
     n_regimes_positive: int
     passed_gate: bool
+    # Precision-optimized meta-labeling acting layer (measured out-of-sample at tau*).
+    precision_oos: float = Field(
+        ..., description="Fraction of ACTED OOS trades that were profitable (R > 0) at tau*."
+    )
+    recall_oos: float = Field(
+        ...,
+        description="Fraction of all profitable OOS opportunities captured at tau* (coverage).",
+    )
+    act_threshold: float = Field(
+        ..., description="tau*, the selected meta-labeling acting threshold (probability in [0,1])."
+    )
+    n_acted_oos: int = Field(
+        ..., description="Number of OOS-reporting-half trades acted on at tau*."
+    )
 
 
 # --------------------------------------------------------------------------- #

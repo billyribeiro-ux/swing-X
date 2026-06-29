@@ -21,6 +21,14 @@ pub struct Thresholds {
     pub divergence_quarantine_r: f64,
     /// minimum realized trades before a divergence verdict is trusted.
     pub divergence_min_trades: usize,
+    /// backtest-vs-live: one-sided z (≈95%) the shortfall must clear to ShrinkSize.
+    pub divergence_z_shrink: f64,
+    /// backtest-vs-live: one-sided z (≈99%) the shortfall must clear to Quarantine.
+    pub divergence_z_quarantine: f64,
+    /// decay: minimum recent live trades before a decay verdict is trusted.
+    pub decay_min_trades: usize,
+    /// decay: one-sided z that realized mean R must clear *below zero* to Demote.
+    pub decay_z: f64,
     /// drawdown: per-strategy CVaR(5%) floor in R (more negative => breach).
     pub drawdown_cvar_floor_r: f64,
     /// drawdown: max-drawdown floor in R (more negative => breach).
@@ -43,6 +51,10 @@ impl Default for Thresholds {
             divergence_shrink_r: 0.25,
             divergence_quarantine_r: 0.50,
             divergence_min_trades: 10,
+            divergence_z_shrink: 1.64,
+            divergence_z_quarantine: 2.33,
+            decay_min_trades: 15,
+            decay_z: 1.64,
             drawdown_cvar_floor_r: -2.0,
             drawdown_maxdd_floor_r: -6.0,
             drawdown_min_trades: 10,
@@ -72,6 +84,20 @@ pub fn mean(xs: &[f64]) -> Option<f64> {
         return None;
     }
     Some(xs.iter().sum::<f64>() / xs.len() as f64)
+}
+
+/// Sample mean, sample standard deviation (n−1 denominator), and `n` for a slice.
+/// `None` when there are fewer than two observations (stddev is undefined). Used by
+/// the significance-tested detectors so the arithmetic is shared and testable.
+pub fn mean_std(xs: &[f64]) -> Option<(f64, f64, usize)> {
+    let n = xs.len();
+    if n < 2 {
+        return None;
+    }
+    let nf = n as f64;
+    let m = xs.iter().sum::<f64>() / nf;
+    let var = xs.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / (nf - 1.0);
+    Some((m, var.sqrt(), n))
 }
 
 /// CVaR (expected shortfall) at the given tail fraction `alpha` (e.g. 0.05),
@@ -114,11 +140,18 @@ pub fn max_drawdown(returns: &[f64]) -> Option<f64> {
 }
 
 /// **backtest-vs-live divergence**. Compares rolling realized expectancy (mean R
-/// over recent live/paper trades) against the strategy's OOS expectancy. A large
-/// shortfall of live below backtest means the edge is not surviving forward.
+/// over recent live/paper trades) against the strategy's OOS expectancy. A shortfall
+/// of live below backtest means the edge may not be surviving forward — but a *bare*
+/// gap is noise-prone, so we require it to be **statistically** significant as well as
+/// **economically** material before acting.
 ///
-/// * gap >= quarantine threshold -> Quarantine
-/// * gap >= shrink threshold     -> ShrinkSize
+/// One-sided test of H0: `live >= oos` vs H1: `live < oos`:
+/// `z = (oos − live) / (s / sqrt(n))` (larger positive `z` = stronger evidence of
+/// decay). With `s == 0` a positive gap is treated as overwhelming evidence (`z = ∞`).
+/// Both bars must clear (so we never act on trivial-but-significant gaps):
+///
+/// * `z >= z_quarantine` AND `gap >= quarantine_r` -> Quarantine
+/// * `z >= z_shrink`     AND `gap >= shrink_r`     -> ShrinkSize
 /// * otherwise / insufficient data -> None
 pub fn detect_divergence(
     realized_r: &[f64],
@@ -128,25 +161,68 @@ pub fn detect_divergence(
     if realized_r.len() < t.divergence_min_trades {
         return None;
     }
-    let live = mean(realized_r)?;
+    // Need at least two obs for a sample stddev; min_trades >= 10 normally guarantees it.
+    let (live, s, n) = mean_std(realized_r)?;
     // Shortfall: how far live underperforms the backtested expectancy.
     let gap = oos_expectancy - live;
-    if gap >= t.divergence_quarantine_r {
+    // One-sided z that live is BELOW oos. s == 0 + positive gap => overwhelming evidence.
+    let z = if s > 0.0 {
+        gap / (s / (n as f64).sqrt())
+    } else if gap > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    if z >= t.divergence_z_quarantine && gap >= t.divergence_quarantine_r {
         Some(Decision {
             metric_value: gap,
             threshold: t.divergence_quarantine_r,
             action: MonitorAction::Quarantine,
             note: format!(
-                "live expectancy {live:.3}R vs OOS {oos_expectancy:.3}R (gap {gap:.3}R) — quarantine"
+                "live expectancy {live:.3}R vs OOS {oos_expectancy:.3}R (gap {gap:.3}R, z {z:.2}, n {n}) — quarantine"
             ),
         })
-    } else if gap >= t.divergence_shrink_r {
+    } else if z >= t.divergence_z_shrink && gap >= t.divergence_shrink_r {
         Some(Decision {
             metric_value: gap,
             threshold: t.divergence_shrink_r,
             action: MonitorAction::ShrinkSize,
             note: format!(
-                "live expectancy {live:.3}R vs OOS {oos_expectancy:.3}R (gap {gap:.3}R) — shrink size"
+                "live expectancy {live:.3}R vs OOS {oos_expectancy:.3}R (gap {gap:.3}R, z {z:.2}, n {n}) — shrink size"
+            ),
+        })
+    } else {
+        None
+    }
+}
+
+/// **expectancy decay**. When there are enough recent live trades and the realized
+/// mean R is **statistically below zero** (one-sided: `−mean / (s/sqrt(n)) >= decay_z`),
+/// the strategy is now losing money with confidence. We Demote it for a refit — the
+/// engine learning from its losses, pulling a bleeding strategy out of the live set.
+///
+/// `win_rate` deliberately plays no part here: a strategy can lose money on positive
+/// win-rate, so the decision is driven purely by realized expectancy and its evidence.
+pub fn detect_decay(realized_r: &[f64], t: &Thresholds) -> Option<Decision> {
+    if realized_r.len() < t.decay_min_trades {
+        return None;
+    }
+    let (m, s, n) = mean_std(realized_r)?;
+    // One-sided z that the realized mean is below zero. s == 0 + negative mean => certain.
+    let z = if s > 0.0 {
+        -m / (s / (n as f64).sqrt())
+    } else if m < 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    if z >= t.decay_z {
+        Some(Decision {
+            metric_value: m,
+            threshold: 0.0,
+            action: MonitorAction::Demote,
+            note: format!(
+                "realized expectancy turned negative (mean {m:.3}R, z {z:.2}, n {n}) — demote for refit"
             ),
         })
     } else {
@@ -285,8 +361,24 @@ mod tests {
     }
 
     #[test]
+    fn mean_std_basics() {
+        assert_eq!(mean_std(&[]), None);
+        assert_eq!(mean_std(&[1.0]), None);
+        // [2,4,4,4,5,5,7,9]: mean 5, sample variance 32/7 -> std = sqrt(32/7).
+        let (m, s, n) = mean_std(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]).unwrap();
+        assert_eq!(n, 8);
+        assert!((m - 5.0).abs() < 1e-12);
+        assert!((s - (32.0_f64 / 7.0).sqrt()).abs() < 1e-12);
+        // Two equal values: zero stddev.
+        let (m, s, n) = mean_std(&[3.0, 3.0]).unwrap();
+        assert_eq!((m, s, n), (3.0, 0.0, 2));
+    }
+
+    #[test]
     fn divergence_escalates_with_gap() {
         let t = Thresholds::default();
+        // Constant vectors => s == 0 => any positive gap is overwhelmingly significant,
+        // so escalation is governed purely by the economic (gap) bar.
         // not enough trades -> None
         assert!(detect_divergence(&[0.0; 5], 0.5, &t).is_none());
         // live ~0.4, oos 0.5 => gap 0.1 < shrink(0.25) -> None
@@ -297,6 +389,49 @@ mod tests {
         // gap 0.60 >= 0.50 -> Quarantine
         let d = detect_divergence(&[-0.1; 12], 0.5, &t).unwrap();
         assert_eq!(d.action, MonitorAction::Quarantine);
+    }
+
+    #[test]
+    fn divergence_requires_statistical_significance() {
+        let t = Thresholds::default();
+        // Same MEAN gap (~0.30R below oos), tight variance => fires ShrinkSize.
+        // mean ≈ 0.2, oos 0.5 => gap ≈ 0.30; tiny spread => large z.
+        let tight: Vec<f64> = (0..12)
+            .map(|i| if i % 2 == 0 { 0.19 } else { 0.21 })
+            .collect();
+        let d = detect_divergence(&tight, 0.5, &t).unwrap();
+        assert_eq!(d.action, MonitorAction::ShrinkSize);
+
+        // SAME mean (~0.2) but HIGH variance => the gap is not significant => None,
+        // even though the bare gap (0.30R) clears the economic bar. This is the point
+        // of the statistical gate: a noisy shortfall is not evidence of decay.
+        let noisy: Vec<f64> = (0..12)
+            .map(|i| if i % 2 == 0 { -3.0 } else { 3.4 })
+            .collect();
+        // mean = 0.2 (same as tight), but stddev ≈ 3.2 => z ≈ 0.32 << 1.64.
+        assert!((mean(&noisy).unwrap() - 0.2).abs() < 1e-9);
+        assert!(detect_divergence(&noisy, 0.5, &t).is_none());
+    }
+
+    #[test]
+    fn decay_demotes_when_expectancy_turns_negative() {
+        let t = Thresholds::default();
+        // 20 trades clearly negative with low variance => Demote with confidence.
+        let bleeding: Vec<f64> = (0..20)
+            .map(|i| if i % 2 == 0 { -0.29 } else { -0.31 })
+            .collect();
+        let d = detect_decay(&bleeding, &t).unwrap();
+        assert_eq!(d.action, MonitorAction::Demote);
+        assert!(d.metric_value < 0.0);
+
+        // Noisy-around-zero => not significantly below zero => None.
+        let noisy: Vec<f64> = (0..20)
+            .map(|i| if i % 2 == 0 { -2.0 } else { 2.0 })
+            .collect();
+        assert!(detect_decay(&noisy, &t).is_none());
+
+        // Too few trades => None.
+        assert!(detect_decay(&[-0.5; 10], &t).is_none());
     }
 
     #[test]

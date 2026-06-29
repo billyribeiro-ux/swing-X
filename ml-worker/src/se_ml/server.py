@@ -44,6 +44,7 @@ from .io_arrow import (
     read_dataset,
     split_features_labels,
 )
+from .labeling.meta_labeling import make_meta_labels
 from .models.gbm import GbmModel, fit_gbm
 from .stats import metrics as mx
 from .stats.dsr import deflated_sharpe_ratio
@@ -148,6 +149,34 @@ def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str,
     return grid
 
 
+def _oos_proba_for_trial(
+    X: pd.DataFrame,
+    y_np: np.ndarray,
+    splits: list,
+    params: dict[str, object],
+    seed: int,
+) -> np.ndarray:
+    """Full-timeline OOS per-observation probabilities for one trial, via CPCV.
+
+    ``proba[i]`` is the purged-CPCV test-fold probability of a profitable trade for row ``i``;
+    rows that never appear in any test fold are ``np.nan``. The trial's feature subset
+    (``params['_features']``) restricts the model's inputs. This is the raw probability layer
+    on top of which an acting threshold tau is applied.
+    """
+    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
+    features = params.get("_features")
+    Xf = X[features] if isinstance(features, list) else X
+    out = np.full(len(X), np.nan, dtype=np.float64)
+    for sp in splits:
+        if sp.train_idx.size == 0 or sp.test_idx.size == 0:
+            continue
+        model = fit_gbm(
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params
+        )
+        out[sp.test_idx] = model.predict_proba(Xf.iloc[sp.test_idx])
+    return out
+
+
 def _oos_returns_for_trial(
     X: pd.DataFrame,
     y_np: np.ndarray,
@@ -160,20 +189,90 @@ def _oos_returns_for_trial(
     A row is an "acted" trade when the purged-trained model is confident (proba >= 0.5);
     its return is the realized R label, else 0. Rows never appearing in a test fold stay 0.
     The trial's feature subset (``params['_features']``) restricts the model's inputs.
+
+    Thin wrapper over :func:`_oos_proba_for_trial`: this thresholded-at-0.5 return matrix
+    drives PBO and IS config selection and is kept UNCHANGED so that selection discipline is
+    untouched by the precision/threshold layer.
     """
-    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
-    features = params.get("_features")
-    Xf = X[features] if isinstance(features, list) else X
-    out = np.zeros(len(X), dtype=np.float64)
-    for sp in splits:
-        if sp.train_idx.size == 0 or sp.test_idx.size == 0:
+    proba = _oos_proba_for_trial(X, y_np, splits, params, seed)
+    acted = np.where(np.isnan(proba), False, proba >= 0.5)
+    return np.where(acted, y_np, 0.0)
+
+
+def select_act_threshold(
+    proba_is: np.ndarray,
+    r_is: np.ndarray,
+    cost: float,
+) -> float:
+    """Select the acting threshold tau* on the in-sample half only (no OOS peeking).
+
+    ``proba_is`` and ``r_is`` are the FINITE-proba IS-half probability and realized-R arrays
+    (same length, already masked to rows that appeared in a test fold). tau* maximizes
+    cost-aware expectancy ``mean(cost_aware_returns(R[acted], cost))`` over IS-half acted rows
+    (acted = proba >= tau), subject to:
+
+      * number of acted rows >= ``max(8, ceil(0.10 * n_is_finite))``, and
+      * IS-half recall >= 0.10  (recall = #acted-and-profitable / #profitable).
+
+    The candidate grid is the unique IS-half proba deciles plus a coarse linspace over
+    [0.30, 0.90] (deduplicated, sorted). If NO candidate satisfies the constraints, falls
+    back to ``0.5`` — preserving the legacy proba >= 0.5 behavior. Deterministic given inputs.
+    """
+    n_is_finite = int(proba_is.size)
+    if n_is_finite == 0:
+        return 0.5
+    min_acted = max(8, int(np.ceil(0.10 * n_is_finite)))
+    labels = make_meta_labels(r_is)  # 1 where realized R > 0 (profitable), else 0
+    n_profit = int(labels.sum())
+
+    deciles = np.quantile(proba_is, np.linspace(0.0, 0.9, 10))
+    coarse = np.linspace(0.30, 0.90, 7)
+    grid = np.unique(np.concatenate([deciles, coarse]))
+
+    best_tau = 0.5
+    best_score = -np.inf
+    found = False
+    for tau in grid:
+        acted = proba_is >= tau
+        n_acted = int(acted.sum())
+        if n_acted < min_acted:
             continue
-        model = fit_gbm(
-            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params
-        )
-        proba = model.predict_proba(Xf.iloc[sp.test_idx])
-        out[sp.test_idx] = np.where(proba >= 0.5, y_np[sp.test_idx], 0.0)
-    return out
+        recall = (int((acted & (labels == 1)).sum()) / n_profit) if n_profit > 0 else 0.0
+        if recall < 0.10:
+            continue
+        score = float(np.mean(mx.cost_aware_returns(r_is[acted], cost)))
+        if score > best_score:
+            best_score = score
+            best_tau = float(tau)
+            found = True
+    return best_tau if found else 0.5
+
+
+def precision_recall_at(
+    proba: np.ndarray,
+    r: np.ndarray,
+    tau: float,
+) -> tuple[float, float, int]:
+    """Precision, recall and acted-count for acting at threshold ``tau``.
+
+    ``proba`` and ``r`` are same-length finite-proba arrays (probability and realized R).
+    Acted = ``proba >= tau``. Returns ``(precision, recall, n_acted)`` where:
+
+      * precision = fraction of ACTED trades that were profitable (R > 0); 0.0 if none acted.
+      * recall    = #acted-and-profitable / #profitable opportunities; 0.0 if no profit rows.
+      * n_acted   = number of acted rows.
+
+    Profitability labels come from :func:`make_meta_labels` (R > 0), keeping the live path's
+    notion of "win" consistent with the staged meta-labeling module.
+    """
+    labels = make_meta_labels(r)
+    acted = proba >= tau
+    n_acted = int(acted.sum())
+    n_profit = int(labels.sum())
+    acted_profit = int((acted & (labels == 1)).sum())
+    precision = (acted_profit / n_acted) if n_acted > 0 else 0.0
+    recall = (acted_profit / n_profit) if n_profit > 0 else 0.0
+    return float(precision), float(recall), n_acted
 
 
 @app.post("/validate", response_model=ValidateResult)
@@ -185,6 +284,12 @@ def validate(req: ValidateRequest) -> ValidateResult:
     matrix: it asks whether the IS-best config stays good OOS. The headline OOS metrics
     (expectancy, DSR, profit factor, ...) report the IS-selected best config — exactly the
     config a naive search would promote — so the gate judges what would actually ship.
+
+    On top of the selected config we add a precision-optimized meta-labeling acting layer:
+    an acting threshold tau* is chosen on the IS half (maximizing cost-aware expectancy under
+    coverage constraints — see :func:`select_act_threshold`), and the gate's OOS metrics plus
+    the reported out-of-sample precision/recall are measured on the tau*-acted OOS rows. Win
+    rate is never computed; precision is the north-star OOS metric.
     """
     from .cv.cpcv import cpcv_splits  # local import keeps server import light
 
@@ -224,11 +329,44 @@ def validate(req: ValidateRequest) -> ValidateResult:
     best = int(np.argmax(is_perf))
     selected = trial_returns[:, best]
 
-    # Mask to rows actually traded by the selected config across the OOS (second) half so
-    # the metrics reflect realized trades, not the zero-padded no-trade rows.
-    oos_slice = selected[mid:]
-    traded = oos_slice[oos_slice != 0.0]
-    realized = traded if traded.size > 0 else oos_slice
+    # Precision/threshold layer on the SELECTED config. Recover its raw per-row OOS
+    # probabilities across the full timeline (np.nan where a row never appeared in a test
+    # fold) so we can choose an acting threshold tau* instead of the hardcoded 0.5.
+    proba = _oos_proba_for_trial(X, y_np, splits, grid[best], seed=1000 + best)
+    idx = np.arange(t)
+    finite = ~np.isnan(proba)
+    is_mask = (idx < mid) & finite
+    oos_mask = (idx >= mid) & finite
+
+    # Select tau* on the IS half only (no peeking at OOS), maximizing cost-aware expectancy
+    # subject to coverage constraints; falls back to 0.5 if nothing qualifies.
+    act_threshold = select_act_threshold(
+        proba[is_mask], y_np[is_mask], DEFAULT_COST_PER_TRADE_R
+    )
+
+    # Measure precision/recall on the OOS half at tau*.
+    precision_oos, recall_oos, n_acted_oos = precision_recall_at(
+        proba[oos_mask], y_np[oos_mask], act_threshold
+    )
+
+    # The whole gate is precision-optimized: feed the tau*-acted OOS realized returns as the
+    # `realized` series. `row_mask` is the full-timeline boolean selecting exactly the rows in
+    # `realized`, so regime attribution aligns row-for-row. Fall back to a non-empty series so
+    # a viable dataset never 422s.
+    row_mask = oos_mask & (np.nan_to_num(proba, nan=-np.inf) >= act_threshold)
+    realized = y_np[row_mask]
+    if realized.size == 0:
+        # tau* acted on nothing OOS: fall back to the legacy 0.5-threshold traded series so
+        # the endpoint stays informative, then the whole OOS half if that is empty too.
+        selected_oos = selected[mid:]
+        traded = selected_oos[selected_oos != 0.0]
+        if traded.size > 0:
+            row_mask = np.zeros(t, dtype=bool)
+            row_mask[mid:] = selected_oos != 0.0
+        else:
+            row_mask = np.zeros(t, dtype=bool)
+            row_mask[mid:] = True
+        realized = y_np[row_mask]
     if realized.size == 0:
         raise HTTPException(status_code=422, detail="no OOS observations produced by CPCV")
 
@@ -248,15 +386,8 @@ def validate(req: ValidateRequest) -> ValidateResult:
     else:
         pbo = 1.0
 
-    # Regime attribution on the OOS-half traded rows of the selected config.
-    oos_half_df = df.iloc[mid:].reset_index(drop=True)
-    if traded.size > 0:
-        traded_mask = oos_slice != 0.0
-        contrib, n_pos = _regime_contrib(
-            oos_half_df.loc[traded_mask].reset_index(drop=True), realized
-        )
-    else:
-        contrib, n_pos = _regime_contrib(oos_half_df, realized)
+    # Regime attribution on exactly the tau*-acted OOS rows feeding the gate.
+    contrib, n_pos = _regime_contrib(df.loc[row_mask].reset_index(drop=True), realized)
 
     gate = gate_evaluate(
         dsr=dsr,
@@ -275,6 +406,10 @@ def validate(req: ValidateRequest) -> ValidateResult:
         regime_contrib=contrib,
         n_regimes_positive=n_pos,
         passed_gate=gate["passed"],
+        precision_oos=float(precision_oos),
+        recall_oos=float(recall_oos),
+        act_threshold=float(act_threshold),
+        n_acted_oos=int(n_acted_oos),
     )
 
 

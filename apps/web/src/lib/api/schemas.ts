@@ -69,6 +69,10 @@ export const oosScoreSchema = z.object({
   mar: z.number(),
   nRegimesPositive: z.number(),
   passedGate: z.boolean(),
+  precisionOos: z.number().optional(),
+  recallOos: z.number().optional(),
+  actThreshold: z.number().optional(),
+  nActed: z.number().optional(),
   evaluatedAt: z.string()
 });
 

@@ -45,11 +45,21 @@ pub struct DailyReport {
     pub calibration: usize,
     pub staleness: usize,
     pub regime_ood: usize,
+    /// strategies demoted because realized expectancy turned negative with confidence.
+    pub decay: usize,
+    /// promoted strategies demoted because their latest OOS score now fails the gate.
+    pub regate: usize,
 }
 
 impl DailyReport {
     pub fn total(&self) -> usize {
-        self.divergence + self.drawdown + self.calibration + self.staleness + self.regime_ood
+        self.divergence
+            + self.drawdown
+            + self.calibration
+            + self.staleness
+            + self.regime_ood
+            + self.decay
+            + self.regate
     }
 }
 
@@ -113,6 +123,46 @@ pub async fn run_daily_with(
         if let Some(d) = detectors::detect_calibration(&convictions, &wins, t) {
             apply_strategy_decision(pool, now, &strat, "calibration_break", &d).await?;
             report.calibration += 1;
+        }
+
+        // expectancy decay -> Demote (status flips to 'demoted'). A promoted strategy
+        // that has started bleeding gets pulled out of the live set for refit.
+        if let Some(d) = detectors::detect_decay(&realized_r, t) {
+            apply_strategy_decision(pool, now, &strat, "decay", &d).await?;
+            report.decay += 1;
+        }
+    }
+
+    // ---- nightly re-gate of promoted strategies ---------------------------
+    // A strategy promoted earlier can have its latest OOS score drift below the hard
+    // gate (new fold, cost changes, regime contribution loss). Re-derive the gate and
+    // demote any 'promoted' strategy whose freshest score no longer passes.
+    for g in load_promoted_gate_inputs(pool).await? {
+        // These four constant comparisons mirror se-validation's PromotionGate
+        // byte-for-byte (dsr > 0 && pbo < 0.5 && oos_expectancy_cost_aware > 0 &&
+        // n_regimes_positive >= 2). Inlined deliberately to avoid a se-validation dep.
+        let passes = matches!(
+            (g.dsr, g.pbo, g.oos_expectancy_cost_aware),
+            (Some(dsr), Some(pbo), Some(exp))
+                if dsr > 0.0 && pbo < 0.5 && exp > 0.0
+        ) && g.n_regimes_positive >= 2;
+        if !passes {
+            let note = format!(
+                "promoted strategy failed re-gate (dsr {:?}, pbo {:?}, oos_exp {:?}, n_regimes_positive {}) — demote",
+                g.dsr, g.pbo, g.oos_expectancy_cost_aware, g.n_regimes_positive
+            );
+            let d = Decision {
+                metric_value: g.oos_expectancy_cost_aware.unwrap_or(f64::NAN),
+                threshold: 0.0,
+                action: MonitorAction::Demote,
+                note,
+            };
+            let strat = StratRow {
+                strategy_id: g.strategy_id,
+                oos_expectancy: g.oos_expectancy_cost_aware,
+            };
+            apply_strategy_decision(pool, now, &strat, "regate_failed", &d).await?;
+            report.regate += 1;
         }
     }
 
@@ -283,6 +333,49 @@ async fn load_strategies(pool: &sqlx::PgPool) -> Result<Vec<StratRow>> {
         .collect())
 }
 
+/// Latest-OOS-score inputs for a single PROMOTED strategy, for the nightly re-gate.
+struct PromotedGateRow {
+    strategy_id: Uuid,
+    dsr: Option<f64>,
+    pbo: Option<f64>,
+    oos_expectancy_cost_aware: Option<f64>,
+    n_regimes_positive: i32,
+}
+
+async fn load_promoted_gate_inputs(pool: &sqlx::PgPool) -> Result<Vec<PromotedGateRow>> {
+    // Each currently-promoted strategy joined to its latest OOS score (LATERAL pulls
+    // the freshest row by evaluated_at). The hard-gate comparison is applied by the
+    // caller so the constants stay co-located with the re-gate comment.
+    type GateInputRow = (Uuid, Option<f64>, Option<f64>, Option<f64>, i32);
+    let rows: Vec<GateInputRow> = sqlx::query_as(
+        "SELECT s.strategy_id, o.dsr, o.pbo, o.oos_expectancy_cost_aware, o.n_regimes_positive \
+         FROM strategies s \
+         JOIN LATERAL ( \
+             SELECT dsr, pbo, oos_expectancy_cost_aware, n_regimes_positive FROM oos_scores \
+             WHERE strategy_id = s.strategy_id \
+             ORDER BY evaluated_at DESC LIMIT 1 \
+         ) o ON TRUE \
+         WHERE s.status = 'promoted'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| se_core::Error::Store(e.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(strategy_id, dsr, pbo, oos_expectancy_cost_aware, n_regimes_positive)| {
+                PromotedGateRow {
+                    strategy_id,
+                    dsr,
+                    pbo,
+                    oos_expectancy_cost_aware,
+                    n_regimes_positive,
+                }
+            },
+        )
+        .collect())
+}
+
 struct TradeRow {
     pnl_r: Option<f64>,
     conviction: Option<f64>,
@@ -291,11 +384,14 @@ struct TradeRow {
 async fn load_recent_trades(pool: &sqlx::PgPool, strategy_id: Uuid) -> Result<Vec<TradeRow>> {
     // Realized R from trades_journal, with the originating signal's conviction for
     // the calibration detector. Only closed trades (pnl_r present) carry a hit/loss.
+    // Restrict to paper/live rows: backtest-replay rows are in-sample replays, not
+    // forward behaviour, so they must never pollute the live-vs-OOS comparison.
     let rows: Vec<(Option<f64>, Option<f64>)> = sqlx::query_as(
         "SELECT t.pnl_r, sg.conviction \
          FROM trades_journal t \
          LEFT JOIN signals sg ON sg.signal_id = t.signal_id \
          WHERE t.strategy_id = $1 \
+           AND t.mode IN ('paper','live') \
            AND t.entry_ts >= now() - ($2 || ' days')::interval \
          ORDER BY t.entry_ts DESC",
     )
@@ -469,8 +565,10 @@ mod tests {
             calibration: 0,
             staleness: 3,
             regime_ood: 1,
+            decay: 2,
+            regate: 1,
         };
-        assert_eq!(r.total(), 7);
+        assert_eq!(r.total(), 10);
     }
 
     #[test]

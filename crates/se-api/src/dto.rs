@@ -66,6 +66,19 @@ pub struct OosScoreDto {
     pub mar: f64,
     pub n_regimes_positive: i64,
     pub passed_gate: bool,
+    /// OUT-OF-SAMPLE precision = P(profit | acted) at the meta-labeling acting threshold τ\*.
+    /// The headline accuracy metric; absent on legacy scores evaluated before τ\* selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision_oos: Option<f64>,
+    /// OOS recall at τ\* — fraction of profitable opportunities captured (coverage honesty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall_oos: Option<f64>,
+    /// τ\* — the selected acting threshold in [0,1].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_threshold: Option<f64>,
+    /// Number of OOS trades acted on at τ\* (the cohort precision is measured over).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n_acted: Option<i64>,
     /// ISO-8601.
     pub evaluated_at: String,
 }

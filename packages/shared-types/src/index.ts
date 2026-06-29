@@ -181,6 +181,14 @@ export interface OosScore {
   nRegimesPositive: number;
   /** Whether the strategy cleared the promotion gate. */
   passedGate: boolean;
+  /** OOS precision = P(profit | acted) at the meta-labeling acting threshold τ*. Headline accuracy. */
+  precisionOos?: number;
+  /** OOS recall at τ* — fraction of profitable opportunities captured. */
+  recallOos?: number;
+  /** τ* — the selected acting threshold in [0, 1]. */
+  actThreshold?: number;
+  /** Number of OOS trades acted on at τ* (cohort the precision is measured over). */
+  nActed?: number;
   /** ISO-8601 timestamp of the evaluation. */
   evaluatedAt: string;
 }

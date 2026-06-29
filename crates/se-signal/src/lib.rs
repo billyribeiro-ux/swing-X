@@ -27,12 +27,22 @@ use se_features::{
 use se_provider::NullProprietary;
 use se_regime::RegimeClassifier;
 use se_search::persist::{latest_oos_score, load_promoted, StoredOosScore};
+use se_search::MIN_ACTED_TO_PROMOTE;
 use se_store::Store;
 
-use crate::conviction::from_cohort;
+use crate::conviction::{from_cohort, from_oos_precision};
+
+/// Live defence-in-depth precision floor: never surface a single-name signal whose strategy's
+/// validated OUT-OF-SAMPLE precision (P(profit | acted) at τ\*) is below this, even though
+/// promotion already optimized the acting threshold for cost-aware OOS expectancy. Low-precision
+/// fades are the most fragile to single-name earnings/gap risk, so we hold the live bar higher
+/// than the search's promote bar. Only applied when the validator measured precision over a
+/// non-trivial acted cohort (`n_acted >= MIN_ACTED_TO_PROMOTE`); legacy scores (NULL precision)
+/// fall back to the cohort-implied conviction and are unaffected.
+pub const MIN_LIVE_PRECISION: f64 = 0.40;
 
 /// Reasons a promoted strategy did not produce a signal at the latest bar (for reporting).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NoSignal {
     NoBars,
     NotFiring,
@@ -42,6 +52,8 @@ pub enum NoSignal {
     GeometryRefused(String),
     /// An earnings release falls inside the would-be holding window (single-name gap risk).
     EarningsBlackout(chrono::NaiveDate),
+    /// The strategy's validated OOS precision (P(profit | acted)) is below the live floor.
+    LowPrecision(f64),
 }
 
 impl std::fmt::Display for NoSignal {
@@ -55,6 +67,12 @@ impl std::fmt::Display for NoSignal {
             NoSignal::GeometryRefused(why) => write!(f, "signal refused: {why}"),
             NoSignal::EarningsBlackout(d) => {
                 write!(f, "earnings blackout (release {d} inside holding window)")
+            }
+            NoSignal::LowPrecision(p) => {
+                write!(
+                    f,
+                    "validated OOS precision {p:.3} below live floor {MIN_LIVE_PRECISION:.2}"
+                )
             }
         }
     }
@@ -213,6 +231,15 @@ pub async fn build_signal_for(
         return Ok(SignalAttempt::Skipped(NoSignal::NoOosScore));
     };
 
+    // Live precision floor (defence-in-depth): when the validator measured this strategy's OOS
+    // precision (P(profit | acted) at τ*) over a non-trivial acted cohort, hold the live single-
+    // name bar above the search's promote bar. Legacy scores (NULL precision) skip this check.
+    if let (Some(p), Some(n)) = (score.precision_oos, score.n_acted) {
+        if n as usize >= MIN_ACTED_TO_PROMOTE && p < MIN_LIVE_PRECISION {
+            return Ok(SignalAttempt::Skipped(NoSignal::LowPrecision(p)));
+        }
+    }
+
     let side = strategy.genome.side;
     let entry = bar.close;
     // Geometry comes from the genome's evolved risk model (stop/target1/target2), not the
@@ -227,12 +254,22 @@ pub async fn build_signal_for(
     } else {
         0.0
     };
-    let conviction = from_cohort(score_expectancy(&score), rr1);
+    // Conviction: prefer the strategy's OUT-OF-SAMPLE measured precision at the meta-labeling
+    // acting threshold τ* (a directly-measured P(profit | acted)) over the expectancy-implied
+    // cohort proxy — but only when measured over a non-trivial acted cohort.
+    let conviction = match (score.precision_oos, score.n_acted) {
+        (Some(p), Some(n)) if n as usize >= MIN_ACTED_TO_PROMOTE => from_oos_precision(p, n),
+        _ => from_cohort(score_expectancy(&score), rr1),
+    };
 
     let drivers = drivers_for(&strategy.genome, &features);
     let invalidation = invalidation_rule(side, stop);
     let cohort_n = score_cohort_n(&score);
-    let lead_time = format!("next-bar-open fill; conviction {} ", conviction.label);
+    let tau = score.act_threshold.unwrap_or(0.5);
+    let lead_time = format!(
+        "next-bar-open fill; conviction {} (acting τ*={tau:.2})",
+        conviction.label
+    );
 
     match Signal::new(
         strategy.id,

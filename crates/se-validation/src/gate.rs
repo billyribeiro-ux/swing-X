@@ -122,6 +122,10 @@ mod tests {
             regime_contrib: BTreeMap::new(),
             n_regimes_positive: n_pos,
             passed_gate: false, // deliberately wrong: gate must ignore it.
+            precision_oos: 0.0,
+            recall_oos: 0.0,
+            act_threshold: 0.5,
+            n_acted_oos: 0,
         }
     }
 

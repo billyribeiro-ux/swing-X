@@ -59,8 +59,9 @@ pub async fn insert_oos_score(
     se_store::sqlx::query(
         "INSERT INTO oos_scores \
             (strategy_id, fold_spec, dsr, pbo, oos_expectancy_cost_aware, profit_factor, \
-             cvar5, mar, regime_contrib, n_regimes_positive, passed_gate) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             cvar5, mar, regime_contrib, n_regimes_positive, passed_gate, \
+             precision_oos, recall_oos, act_threshold, n_acted) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(score.strategy_id.inner())
     .bind(fold_spec)
@@ -73,6 +74,10 @@ pub async fn insert_oos_score(
     .bind(regime_contrib)
     .bind(score.n_regimes_positive)
     .bind(score.passed_gate)
+    .bind(score.precision_oos)
+    .bind(score.recall_oos)
+    .bind(score.act_threshold)
+    .bind(score.n_acted_oos as i32)
     .execute(store.pool())
     .await
     .map_err(store_err)?;
@@ -147,10 +152,15 @@ pub async fn latest_oos_score(store: &Store, id: StrategyId) -> Result<Option<St
         i32,
         bool,
         serde_json::Value,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<i32>,
     );
     let row: Option<Row> = se_store::sqlx::query_as(
         "SELECT dsr, pbo, oos_expectancy_cost_aware, profit_factor, cvar5, mar, \
-                regime_contrib, n_regimes_positive, passed_gate, fold_spec \
+                regime_contrib, n_regimes_positive, passed_gate, fold_spec, \
+                precision_oos, recall_oos, act_threshold, n_acted \
          FROM oos_scores WHERE strategy_id = $1 ORDER BY evaluated_at DESC LIMIT 1",
     )
     .bind(id.inner())
@@ -175,6 +185,11 @@ pub async fn latest_oos_score(store: &Store, id: StrategyId) -> Result<Option<St
             n_regimes_positive: r.7,
             passed_gate: r.8,
             n_entries,
+            precision_oos: r.10,
+            recall_oos: r.11,
+            act_threshold: r.12,
+            // `n_acted` is stored as INT (i32); widen to i64 to mirror the wire/`OosScore` type.
+            n_acted: r.13.map(i64::from),
         }
     }))
 }
@@ -193,6 +208,14 @@ pub struct StoredOosScore {
     pub passed_gate: bool,
     /// Cohort size (entry count) recovered from the stored `fold_spec` JSON.
     pub n_entries: u32,
+    /// OOS precision at τ\* (None for rows scored before the precision migration).
+    pub precision_oos: Option<f64>,
+    /// OOS recall at τ\* (None for pre-migration rows).
+    pub recall_oos: Option<f64>,
+    /// τ\* — the acting threshold the signal layer reads to size/act (None for pre-migration rows).
+    pub act_threshold: Option<f64>,
+    /// OOS trades acted on at τ\* (None for pre-migration rows).
+    pub n_acted: Option<i64>,
 }
 
 fn parse_status(s: &str) -> StrategyStatus {

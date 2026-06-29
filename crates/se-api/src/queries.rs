@@ -263,11 +263,13 @@ pub async fn population(
     let sql = format!(
         "SELECT s.strategy_id, s.horizon, s.status, s.generation, s.genome, \
                 o.dsr, o.pbo, o.oos_expectancy_cost_aware, o.profit_factor, o.cvar5, o.mar, \
-                o.n_regimes_positive, o.passed_gate, o.evaluated_at \
+                o.n_regimes_positive, o.passed_gate, o.precision_oos, o.recall_oos, \
+                o.act_threshold, o.n_acted, o.evaluated_at \
          FROM strategies s \
          LEFT JOIN LATERAL ( \
              SELECT dsr, pbo, oos_expectancy_cost_aware, profit_factor, cvar5, mar, \
-                    n_regimes_positive, passed_gate, evaluated_at \
+                    n_regimes_positive, passed_gate, precision_oos, recall_oos, \
+                    act_threshold, n_acted, evaluated_at \
              FROM oos_scores WHERE strategy_id = s.strategy_id \
              ORDER BY evaluated_at DESC LIMIT 1 \
          ) o ON TRUE{} \
@@ -299,6 +301,14 @@ pub async fn population(
                 mar: row.try_get("mar").ok().flatten().unwrap_or(0.0),
                 n_regimes_positive: row.get::<i32, _>("n_regimes_positive") as i64,
                 passed_gate: row.get("passed_gate"),
+                precision_oos: row.try_get("precision_oos").ok().flatten(),
+                recall_oos: row.try_get("recall_oos").ok().flatten(),
+                act_threshold: row.try_get("act_threshold").ok().flatten(),
+                n_acted: row
+                    .try_get::<Option<i32>, _>("n_acted")
+                    .ok()
+                    .flatten()
+                    .map(i64::from),
                 evaluated_at: iso(ts),
             });
             StrategyDto {
