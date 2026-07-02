@@ -24,8 +24,8 @@ use crate::feature_matrix::{build_window, FeatureWindow};
 use crate::risk_search::RiskSpace;
 use crate::rng::Rng;
 use crate::score::{
-    genome_has_actionable_predicate, score_oos, OosScore, ScoreConfig, MIN_ACTED_TO_PROMOTE,
-    MIN_ENTRIES_TO_VALIDATE,
+    genome_has_actionable_predicate, genome_signature, score_oos, OosScore, ScoreConfig,
+    MIN_ACTED_TO_PROMOTE, MIN_ENTRIES_TO_VALIDATE,
 };
 use crate::seed::{seed_population, FeatureCatalog};
 use crate::{genome_ops, persist};
@@ -294,19 +294,47 @@ impl<'a> PopulationManager<'a> {
 
         let mut all_evaluated: Vec<Evaluated> = Vec::new();
         let mut survivors: Vec<Genome> = Vec::new();
+        // Signatures of every DISTINCT genome we have already created/scored/persisted, across all
+        // generations. Deduplicating candidates against this set (in `next_generation`) is what
+        // stops the population from inflating with identical genomes — each of which would
+        // otherwise become its own strategy row, its own OOS score, and its own promotion. Because
+        // dedup happens at candidate-creation time, PROMOTION cannot produce two promoted
+        // strategies with the same signature either: a genome equal to one already created in a
+        // prior generation is never re-created, so it is never re-scored or re-promoted.
+        let mut seen_signatures: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        // A STABLE strategy identity per canonical signature. Elite survivors are carried forward
+        // every generation (that is deliberate — the elitism/re-scoring path), so without this a
+        // single surviving genome would be re-wrapped in a fresh `Strategy` (new `StrategyId`) each
+        // generation and `upsert_strategy` would INSERT a new row + a new promotion for the very
+        // same genome — the exact inflation being fixed. Reusing the signature's first-assigned id
+        // makes those re-persists UPDATE the one row (same id) instead. Fresh genomes get a new id.
+        let mut id_for_signature: std::collections::BTreeMap<String, StrategyId> =
+            std::collections::BTreeMap::new();
 
         for gen in 0..generations {
             let mut rng = Rng::seeded(self.cfg.base_seed, gen);
 
             // Build this generation's genomes: survivors + their mutations/crossovers, topped up
-            // with fresh seeds to `per_gen`.
-            let genomes = self.next_generation(&survivors, per_gen, &mut rng);
+            // with fresh seeds to `per_gen`. Deduplicated by canonical signature within the
+            // generation AND against every genome already created in a prior generation.
+            let genomes = self.next_generation(&survivors, per_gen, &mut seen_signatures, &mut rng);
 
             tracing::info!(generation = gen, n = genomes.len(), "evaluating generation");
 
             let mut evaluated: Vec<Evaluated> = Vec::new();
             for genome in genomes {
+                // Reuse the stable id already assigned to this genome's signature (survivors, or an
+                // equal genome from a prior gen) so re-persist UPDATES that row; otherwise mint a
+                // fresh id and remember it. Never create two strategy rows for one signature.
+                let sig = genome_signature(&genome);
+                // `StrategyId::new()` mints a fresh random UUID; it is NOT the type's default
+                // (a nil UUID), so clippy's `or_default()` suggestion would collapse every unseen
+                // signature onto the same nil id — exactly the duplication we are removing.
+                #[allow(clippy::unwrap_or_default)]
+                let id = *id_for_signature.entry(sig).or_insert_with(StrategyId::new);
                 let mut strategy = Strategy::new(genome);
+                strategy.id = id;
                 strategy.generation = gen;
                 let ev = self.evaluate_genome(strategy).await?;
                 self.persist(&ev).await?;
@@ -340,9 +368,32 @@ impl<'a> PopulationManager<'a> {
     /// ones are kept. Widening `offspring_pool_mult` changes only which candidates fill the
     /// non-elite slots — the number scored stays `per_gen`, and survivors are always carried
     /// forward first (unchanged elitism). This never touches the survivor/ranking/gate logic.
-    fn next_generation(&self, survivors: &[Genome], per_gen: usize, rng: &mut Rng) -> Vec<Genome> {
+    ///
+    /// DEDUPLICATION: candidates are keyed by [`genome_signature`] — an order-independent canonical
+    /// signature — so two genomes that would fire and manage risk identically are treated as one.
+    /// A candidate is dropped if its signature was already produced (a) earlier in this same
+    /// generation, or (b) in ANY prior generation (tracked in `seen`, which persists across the
+    /// whole `evolve` run). This is what stops the population inflating with duplicate genomes that
+    /// would each become a separate strategy/score/promotion. Carried-forward survivors are the one
+    /// exception: they are always kept (elitism) even though their signature is already in `seen`
+    /// from the generation that created them — dropping them would break elitism, and they are not
+    /// re-persisted as new strategies here.
+    fn next_generation(
+        &self,
+        survivors: &[Genome],
+        per_gen: usize,
+        global_seen: &mut std::collections::BTreeSet<String>,
+        rng: &mut Rng,
+    ) -> Vec<Genome> {
         let mut genomes: Vec<Genome> = Vec::new();
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut dropped: usize = 0;
+
+        // Local dedup set for building this generation's pool: seeded with every signature seen in
+        // a PRIOR generation, so a candidate equal to any already-created genome is dropped here
+        // (never re-scored, never re-persisted, never re-promoted). We commit only the KEPT genomes'
+        // signatures back to `global_seen` after truncation, so genomes that get truncated out of
+        // the over-sized pool remain available to explore in a later generation.
+        let mut seen = global_seen.clone();
 
         // The richer candidate pool we draw from before truncating to `per_gen`. `>= per_gen` so a
         // multiple of 1 (or less) reproduces the legacy per_gen-sized behavior.
@@ -350,17 +401,26 @@ impl<'a> PopulationManager<'a> {
             ((per_gen as f64) * self.cfg.offspring_pool_mult.max(1.0)).ceil() as usize;
         let pool_target = pool_target.max(per_gen);
 
-        let push =
-            |g: Genome, seen: &mut std::collections::BTreeSet<String>, out: &mut Vec<Genome>| {
-                if seen.insert(g.describe()) {
-                    out.push(g);
-                }
-            };
+        // Push a NEW candidate: keep it only if its canonical signature is unseen (within this
+        // generation and across all prior ones). Later duplicates are dropped (counted for the
+        // debug log). Keeps the first occurrence. Delegates the signature rule to `admit_unique`.
+        let push = |g: Genome,
+                    seen: &mut std::collections::BTreeSet<String>,
+                    dropped: &mut usize,
+                    out: &mut Vec<Genome>| {
+            if !admit_unique(g, seen, out) {
+                *dropped += 1;
+            }
+        };
 
         // Carry survivors forward (elitism) + their mutations and pairwise crossovers. Survivors
-        // keep their own (already-scored) risk geometry — that geometry is part of what won.
+        // keep their own (already-scored) risk geometry — that geometry is part of what won. Their
+        // signatures are already in `seen` (from the generation that created them), so we add them
+        // unconditionally rather than through `push`, and (re)mark the signature so the rest of
+        // this generation still dedups against them.
         for g in survivors {
-            push(g.clone(), &mut seen, &mut genomes);
+            seen.insert(genome_signature(g));
+            genomes.push(g.clone());
         }
         // One guaranteed mutation per survivor first (preserves prior behavior for the head of the
         // list), capped at `per_gen` so elitism + first mutations are unchanged from before.
@@ -374,7 +434,7 @@ impl<'a> PopulationManager<'a> {
             if !self.cfg.lock_risk {
                 m.risk = self.risk_space.mutate(&g.risk, rng);
             }
-            push(m, &mut seen, &mut genomes);
+            push(m, &mut seen, &mut dropped, &mut genomes);
         }
         if survivors.len() >= 2 {
             for pair in survivors.windows(2) {
@@ -387,7 +447,7 @@ impl<'a> PopulationManager<'a> {
                 } else {
                     self.risk_space.crossover(&pair[0].risk, &pair[1].risk, rng)
                 };
-                push(c, &mut seen, &mut genomes);
+                push(c, &mut seen, &mut dropped, &mut genomes);
             }
         }
 
@@ -407,7 +467,7 @@ impl<'a> PopulationManager<'a> {
                 if !self.cfg.lock_risk {
                     m.risk = self.risk_space.mutate(&parent.risk, rng);
                 }
-                push(m, &mut seen, &mut genomes);
+                push(m, &mut seen, &mut dropped, &mut genomes);
             }
         }
 
@@ -426,11 +486,31 @@ impl<'a> PopulationManager<'a> {
                 if genomes.len() >= pool_target {
                     break;
                 }
-                push(self.assign_seed_risk(g, rng), &mut seen, &mut genomes);
+                push(
+                    self.assign_seed_risk(g, rng),
+                    &mut seen,
+                    &mut dropped,
+                    &mut genomes,
+                );
             }
         }
 
         genomes.truncate(per_gen);
+
+        // Commit the KEPT genomes' signatures to the run-wide `global_seen` so no later generation
+        // re-creates (and thus re-scores/re-persists/re-promotes) an equal genome. Only the kept
+        // ones are committed — truncated pool-tail candidates stay explorable later.
+        for g in &genomes {
+            global_seen.insert(genome_signature(g));
+        }
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                kept = genomes.len(),
+                "deduplicated candidate genomes by canonical signature"
+            );
+        }
+
         genomes
     }
 
@@ -453,6 +533,27 @@ impl<'a> PopulationManager<'a> {
             // Unscored (tiny dataset) strategies stay `candidate` but are not carried forward.
         }
         Ok(survivors)
+    }
+}
+
+/// Attempt to admit one candidate genome into a deduplicated set. Returns `true` (and pushes `g`
+/// onto `out`) iff its canonical [`genome_signature`] was not already in `seen`; otherwise returns
+/// `false` and leaves `out` untouched. `seen` accumulates every admitted (and pre-seeded)
+/// signature. Keeps the FIRST occurrence of each signature; every later equal genome is rejected.
+///
+/// This is the single dedup primitive used when assembling a generation's candidate pool
+/// (see [`PopulationManager::next_generation`]): pre-seed `seen` with prior-generation signatures
+/// to also reject genomes equal to any already created earlier in the run.
+fn admit_unique(
+    g: Genome,
+    seen: &mut std::collections::BTreeSet<String>,
+    out: &mut Vec<Genome>,
+) -> bool {
+    if seen.insert(genome_signature(&g)) {
+        out.push(g);
+        true
+    } else {
+        false
     }
 }
 
@@ -596,5 +697,90 @@ mod tests {
             "too few acted OOS trades must block promotion"
         );
         assert!(ev.survives(), "but it is still kept as a survivor");
+    }
+
+    // Two predicates over distinct features/layers, used to build order-permuted duplicates.
+    fn two_pred_genome(order_swapped: bool) -> Genome {
+        let p_trig = Predicate {
+            layer: Layer::Trigger,
+            feature_key: "trigger.rsi14".into(),
+            op: CmpOp::Gt,
+            threshold: 55.0,
+        };
+        let p_reg = Predicate {
+            layer: Layer::Regime,
+            feature_key: "regime.adx".into(),
+            op: CmpOp::Lt,
+            threshold: 20.0,
+        };
+        let preds = if order_swapped {
+            vec![p_reg, p_trig]
+        } else {
+            vec![p_trig, p_reg]
+        };
+        Genome::new(Side::Long, Horizon::Swing, preds)
+    }
+
+    #[test]
+    fn dedup_drops_signature_duplicates_keeping_first() {
+        // A candidate pool built to CONTAIN duplicates: the same conjunction in two predicate
+        // orders, plus a sub-grid-noise threshold twin, plus a genuinely different genome.
+        let mut noisy = two_pred_genome(false);
+        // Nudge a threshold below the 4-decimal signature grid: still the same firing genome.
+        noisy.predicates[0].threshold = 55.000_001;
+
+        let genuinely_different =
+            Genome::new(Side::Short, Horizon::Swing, vec![pred(Layer::Trigger)]);
+
+        let candidates = vec![
+            two_pred_genome(false),      // first occurrence — kept
+            two_pred_genome(true),       // same set, swapped order — dropped
+            noisy,                       // same set, sub-grid threshold noise — dropped
+            genuinely_different.clone(), // distinct — kept
+            genuinely_different,         // exact repeat — dropped
+        ];
+
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut kept: Vec<Genome> = Vec::new();
+        let mut dropped = 0usize;
+        for g in candidates {
+            if !admit_unique(g, &mut seen, &mut kept) {
+                dropped += 1;
+            }
+        }
+
+        assert_eq!(kept.len(), 2, "only the two distinct genomes survive dedup");
+        assert_eq!(dropped, 3, "the three duplicates are dropped");
+
+        // The invariant the fix guarantees: no two KEPT genomes share a signature.
+        let sigs: std::collections::BTreeSet<String> = kept.iter().map(genome_signature).collect();
+        assert_eq!(
+            sigs.len(),
+            kept.len(),
+            "deduped candidate set must contain no two equal signatures"
+        );
+    }
+
+    #[test]
+    fn dedup_rejects_candidate_equal_to_a_prior_generation_genome() {
+        // Simulate cross-generation dedup: `seen` is pre-seeded with a genome created in an
+        // earlier generation. A later candidate equal to it (even with permuted predicate order)
+        // must be rejected so it is never re-created / re-scored / re-promoted.
+        let prior = two_pred_genome(false);
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        seen.insert(genome_signature(&prior));
+
+        let mut kept: Vec<Genome> = Vec::new();
+        // Equal genome, predicates in swapped order — must be rejected against the prior gen.
+        let admitted = admit_unique(two_pred_genome(true), &mut seen, &mut kept);
+        assert!(
+            !admitted && kept.is_empty(),
+            "a genome equal to a prior-generation one must be rejected at candidate time"
+        );
+
+        // A genuinely new genome is still admitted.
+        let fresh = Genome::new(Side::Short, Horizon::Day, vec![pred(Layer::Location)]);
+        assert!(admit_unique(fresh, &mut seen, &mut kept));
+        assert_eq!(kept.len(), 1);
     }
 }

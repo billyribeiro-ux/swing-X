@@ -12,11 +12,17 @@ at the SELECTED tau* must lift (or at least maintain) precision versus acting at
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
+from se_ml.config import CONFIG
+from se_ml.contract import ValidateRequest, ValidateResult
+from se_ml.io_arrow import write_dataframe
 from se_ml.server import (
     DEFAULT_COST_PER_TRADE_R,
+    forward_holdout_precision,
     precision_recall_at,
     select_act_threshold,
+    validate,
 )
 
 
@@ -294,3 +300,185 @@ def test_two_subfold_robustness_rejects_sliver_precise_threshold() -> None:
     tau = select_act_threshold(proba_is, r_is, DEFAULT_COST_PER_TRADE_R)
     assert tau != high_tau
     assert tau == 0.5, "robustness must reject the sliver-precise high tier and fall back"
+
+
+# --------------------------------------------------------------------------- #
+# Strict time-ordered forward-holdout durability (precision_forward / expectancy_forward)
+# --------------------------------------------------------------------------- #
+_FWD_REGIMES = np.array(["bull", "bear", "chop"])
+_FWD_FOLD = {"n_groups": 6, "k_test_groups": 2, "embargo_bars": 3, "purge": True}
+_FWD_PARAMS: dict[str, object] = {
+    "num_leaves": 31,
+    "learning_rate": 0.05,
+    "n_estimators": 120,
+    "_features": ["momentum__signal", "trend__slope", "volatility__atr", "momentum__noise"],
+}
+
+
+def _stable_edge_dataset(n: int = 1500, seed: int = 0) -> pd.DataFrame:
+    """A genuine edge that is STABLE across the whole timeline (features causally drive R)."""
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2020-01-01", periods=n, freq="D")
+    t1 = ts + pd.Timedelta(days=3)
+    f1, f2, f3 = rng.normal(size=n), rng.normal(size=n), rng.normal(size=n)
+    signal = 0.9 * f1 + 0.6 * f2 - 0.3 * f3
+    label = np.clip(signal + rng.normal(scale=1.0, size=n), -1.0, 2.0)
+    regime = _FWD_REGIMES[rng.integers(0, 3, size=n)]
+    return pd.DataFrame(
+        {
+            "ts": ts,
+            "t1": t1,
+            "label": label,
+            "regime": regime,
+            "momentum__signal": f1,
+            "trend__slope": f2,
+            "volatility__atr": f3,
+            "momentum__noise": rng.normal(size=n),
+        }
+    )
+
+
+def _early_only_edge_dataset(n: int = 1500, seed: int = 0, flip: float = 0.80) -> pd.DataFrame:
+    """An edge that exists ONLY in the early period, then FLIPS/vanishes in the later tail.
+
+    The same features->R relationship holds for the earliest ``flip`` fraction of the
+    timeline, then its sign flips for the tail. CPCV shuffles folds across the whole timeline
+    so it still sees plenty of the early edge (its reported precision looks OK); the strict
+    forward holdout — fit on 70%, judged on the latest 30% (entirely in the dead/flipped
+    tail) — collapses. This is exactly the regime-fitting the forward metric must catch.
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range("2020-01-01", periods=n, freq="D")
+    t1 = ts + pd.Timedelta(days=3)
+    f1, f2, f3 = rng.normal(size=n), rng.normal(size=n), rng.normal(size=n)
+    signal = 0.9 * f1 + 0.6 * f2 - 0.3 * f3
+    sign = np.ones(n)
+    sign[int(flip * n):] = -1.0
+    label = np.clip(sign * signal + rng.normal(scale=1.0, size=n), -1.5, 1.5)
+    regime = _FWD_REGIMES[rng.integers(0, 3, size=n)]
+    return pd.DataFrame(
+        {
+            "ts": ts,
+            "t1": t1,
+            "label": label,
+            "regime": regime,
+            "momentum__signal": f1,
+            "trend__slope": f2,
+            "volatility__atr": f3,
+            "momentum__noise": rng.normal(size=n),
+        }
+    )
+
+
+def _validate_df(df: pd.DataFrame, name: str) -> ValidateResult:
+    path = CONFIG.data_dir / name
+    write_dataframe(df, path)
+    req = ValidateRequest(
+        dataset_uri=str(path),
+        horizon="swing",
+        fold_spec=_FWD_FOLD,  # type: ignore[arg-type]
+        n_trials=16,
+    )
+    return validate(req)
+
+
+def test_forward_holdout_stable_edge_precision_positive_and_comparable() -> None:
+    """A stable-across-time edge: forward precision is > 0 and comparable to CPCV precision."""
+    res = _validate_df(_stable_edge_dataset(seed=0), "fwd_stable.parquet")
+
+    # The forward holdout confirms the edge survives going forward.
+    assert res.precision_forward > 0.0, res
+    assert res.expectancy_forward > 0.0, res
+    assert res.n_forward > 0, res
+    # Comparable to CPCV precision (durable edge => forward doesn't collapse relative to CPCV).
+    assert res.precision_forward >= 0.6 * res.precision_oos, res
+    # Field-range invariants the contract guarantees.
+    assert 0.0 <= res.precision_forward <= 1.0
+
+
+def test_forward_holdout_early_only_edge_collapses_even_when_cpcv_ok() -> None:
+    """Edge only in the EARLY period: CPCV precision looks OK, forward metric collapses.
+
+    Proves the strict forward holdout catches regime-fitting that CPCV's shuffled folds mask:
+    the CPCV OOS precision stays middling (the shuffle still samples the early edge), yet the
+    forward-held-out expectancy goes negative and forward precision drops well below CPCV.
+    """
+    res = _validate_df(_early_only_edge_dataset(seed=0, flip=0.80), "fwd_early.parquet")
+
+    # CPCV precision does NOT collapse (its shuffle still sees the early edge) — it is the
+    # metric that would let a regime-fit edge slip through.
+    assert res.precision_oos > 0.3, res
+
+    # The strict forward metric collapses: forward expectancy is negative (the edge does NOT
+    # hold going forward) and forward precision is materially below the CPCV precision.
+    assert res.expectancy_forward < 0.0, res
+    assert res.precision_forward < res.precision_oos, res
+
+
+def test_forward_holdout_precision_helper_stable_vs_early() -> None:
+    """Pure-helper contrast: stable edge stays profitable forward; early-only collapses."""
+    df_stable = _stable_edge_dataset(seed=1)
+    df_early = _early_only_edge_dataset(seed=1, flip=0.80)
+    feats = ["momentum__signal", "trend__slope", "volatility__atr", "momentum__noise"]
+
+    prec_s, exp_s, n_s = forward_holdout_precision(
+        df_stable[feats],
+        df_stable["label"].to_numpy(),
+        df_stable["ts"].to_numpy(),
+        _FWD_PARAMS,
+        DEFAULT_COST_PER_TRADE_R,
+        seed=1,
+    )
+    prec_e, exp_e, n_e = forward_holdout_precision(
+        df_early[feats],
+        df_early["label"].to_numpy(),
+        df_early["ts"].to_numpy(),
+        _FWD_PARAMS,
+        DEFAULT_COST_PER_TRADE_R,
+        seed=1,
+    )
+
+    assert exp_s > 0.0 and prec_s > 0.0 and n_s > 0
+    # Early-only edge: forward expectancy collapses (negative) relative to the stable edge.
+    assert exp_e < exp_s
+    assert exp_e < 0.0
+    assert 0.0 <= prec_e <= 1.0 and n_e >= 0
+
+
+def test_forward_holdout_precision_is_deterministic() -> None:
+    df = _stable_edge_dataset(seed=2)
+    feats = ["momentum__signal", "trend__slope", "volatility__atr", "momentum__noise"]
+    args = (
+        df[feats],
+        df["label"].to_numpy(),
+        df["ts"].to_numpy(),
+        _FWD_PARAMS,
+        DEFAULT_COST_PER_TRADE_R,
+    )
+    a = forward_holdout_precision(*args, seed=5)
+    b = forward_holdout_precision(*args, seed=5)
+    assert a == b
+
+
+def test_forward_holdout_degenerate_returns_zeros_no_crash() -> None:
+    """Empty / no-usable-split inputs return zeros and never crash."""
+    empty = pd.DataFrame({"momentum__signal": [], "trend__slope": []})
+    assert forward_holdout_precision(
+        empty,
+        np.array([], dtype=np.float64),
+        np.array([], dtype="datetime64[ns]"),
+        {"_features": ["momentum__signal", "trend__slope"]},
+        DEFAULT_COST_PER_TRADE_R,
+        seed=0,
+    ) == (0.0, 0.0, 0)
+
+    # A single row cannot form both a train and a holdout split -> zeros.
+    one = pd.DataFrame({"momentum__signal": [0.1], "trend__slope": [0.2]})
+    assert forward_holdout_precision(
+        one,
+        np.array([1.0], dtype=np.float64),
+        np.array(["2020-01-01"], dtype="datetime64[ns]"),
+        {"_features": ["momentum__signal", "trend__slope"]},
+        DEFAULT_COST_PER_TRADE_R,
+        seed=0,
+    ) == (0.0, 0.0, 0)

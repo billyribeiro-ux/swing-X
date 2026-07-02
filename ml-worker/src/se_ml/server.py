@@ -372,6 +372,75 @@ def precision_recall_at(
     return float(precision), float(recall), n_acted
 
 
+def forward_holdout_precision(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    ts: np.ndarray,
+    params: dict[str, object],
+    cost: float,
+    seed: int,
+) -> tuple[float, float, int]:
+    """Strict TIME-ORDERED forward-holdout precision/expectancy for the selected config.
+
+    Unlike CPCV (which shuffles folds across the whole timeline and can inflate reported
+    precision via regime/bull bias), this fits ONLY on the earliest 70% of the timeline and
+    judges on the latest 30% — a "does the edge hold going FORWARD" durability check that
+    separates a real edge from regime-fitting. It is REPORTED, never gating.
+
+    Algorithm (deterministic given ``seed``; the caller passes rows already in event-time
+    order, and we sort by ``ts`` defensively without shuffling):
+
+      1. Order rows by ``ts`` (stable). Split at 70%: TRAIN = earliest 70%, HOLDOUT = latest
+         30%.
+      2. Fit one GBM on TRAIN features->labels using the SELECTED config's params (the
+         trial's ``_features`` subset is honored; LightGBM-only params are passed through).
+         Predict profitability probabilities on HOLDOUT.
+      3. Select the acting threshold tau* on TRAIN (``select_act_threshold`` on the TRAIN
+         proba/returns), then MEASURE on HOLDOUT with ``precision_recall_at``:
+           * ``precision`` = P(profit | acted) on the forward holdout at tau*,
+           * ``expectancy`` = mean cost-aware R over acted holdout rows,
+           * ``n`` = acted holdout count.
+
+    Degenerate cases (empty split, empty acted set) return ``(0.0, 0.0, 0)`` — never crash.
+    """
+    n = int(len(X))
+    if n == 0:
+        return 0.0, 0.0, 0
+
+    # Defensive stable sort by event time; the dataset is already time-ordered so this is a
+    # no-op there, but it guarantees the forward split is genuinely chronological.
+    order = np.argsort(ts, kind="stable")
+    X_ord = X.iloc[order].reset_index(drop=True)
+    y_ord = np.asarray(y, dtype=np.float64)[order]
+
+    cut = int(np.floor(0.70 * n))
+    if cut <= 0 or cut >= n:
+        # No usable train or no usable holdout: degenerate, report zeros.
+        return 0.0, 0.0, 0
+
+    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
+    features = params.get("_features")
+    Xf = X_ord[features] if isinstance(features, list) else X_ord
+
+    X_train, X_hold = Xf.iloc[:cut], Xf.iloc[cut:]
+    y_train, y_hold = y_ord[:cut], y_ord[cut:]
+
+    # Fit the primary model on TRAIN only, predict on HOLDOUT.
+    model = fit_gbm(X_train, y_train, seed=seed, params=model_params)
+    proba_train = model.predict_proba(X_train)
+    proba_hold = model.predict_proba(X_hold)
+
+    # Select tau* on TRAIN (no HOLDOUT peeking), then measure on HOLDOUT.
+    tau = select_act_threshold(proba_train, y_train, cost)
+    precision, _recall, n_acted = precision_recall_at(proba_hold, y_hold, tau)
+    if n_acted == 0:
+        return 0.0, 0.0, 0
+
+    acted = proba_hold >= tau
+    expectancy = float(np.mean(mx.cost_aware_returns(y_hold[acted], cost)))
+    return float(precision), expectancy, int(n_acted)
+
+
 @app.post("/validate", response_model=ValidateResult)
 def validate(req: ValidateRequest) -> ValidateResult:
     """Run CPCV over a trial grid, compute DSR/PBO, and apply the promotion gate.
@@ -388,6 +457,14 @@ def validate(req: ValidateRequest) -> ValidateResult:
     robustness — see :func:`select_act_threshold`), and the gate's OOS metrics plus the
     reported out-of-sample precision/recall are measured on the tau*-acted OOS rows. Win rate
     is never computed; precision is the north-star OOS metric.
+
+    Alongside the CPCV precision we also report a STRICTER, time-ordered forward-holdout
+    durability metric (``precision_forward``, ``expectancy_forward``, ``n_forward``): the
+    selected config is refit on the earliest 70% of the timeline and judged on the latest 30%
+    (see :func:`forward_holdout_precision`). Because CPCV shuffles folds across the whole
+    timeline, its precision can be inflated by regime/bull bias; the forward holdout asks
+    whether the edge holds going FORWARD and so separates a real edge from regime-fitting. It
+    is REPORTED, never gating.
     """
     from .cv.cpcv import cpcv_splits  # local import keeps server import light
 
@@ -495,6 +572,21 @@ def validate(req: ValidateRequest) -> ValidateResult:
         n_regimes_positive=n_pos,
     )
 
+    # STRICT forward-held-out durability (reported, NOT gating): refit the SELECTED config on
+    # the earliest 70% of the (time-ordered) timeline and judge on the latest 30%. Never
+    # crashes; degenerate/empty holdout acted sets report zeros.
+    try:
+        precision_forward, expectancy_forward, n_forward = forward_holdout_precision(
+            X,
+            y_np,
+            df[TS_COL].to_numpy(),
+            grid[best],
+            DEFAULT_COST_PER_TRADE_R,
+            seed=1000 + best,
+        )
+    except (ValueError, KeyError):
+        precision_forward, expectancy_forward, n_forward = 0.0, 0.0, 0
+
     return ValidateResult(
         dsr=float(dsr),
         pbo=float(pbo),
@@ -509,6 +601,9 @@ def validate(req: ValidateRequest) -> ValidateResult:
         recall_oos=float(recall_oos),
         act_threshold=float(act_threshold),
         n_acted_oos=int(n_acted_oos),
+        precision_forward=float(precision_forward),
+        expectancy_forward=float(expectancy_forward),
+        n_forward=int(n_forward),
     )
 
 
