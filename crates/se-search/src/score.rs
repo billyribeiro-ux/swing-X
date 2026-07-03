@@ -137,6 +137,72 @@ impl OosScore {
     }
 }
 
+/// Threshold rounding precision (decimal places) for the genome signature. A stable, coarse
+/// grid so two genomes whose thresholds differ only in noise below this precision collapse to
+/// the same signature. Matches the 4-decimal display precision of [`se_core::Predicate::describe`]
+/// so signature-equal genomes also read identically by eye.
+const SIGNATURE_THRESHOLD_DECIMALS: i32 = 4;
+
+/// Round a threshold to the stable signature grid. `-0.0` is normalized to `0.0` so the two zeros
+/// never produce different signatures.
+fn round_threshold(t: f64) -> f64 {
+    if !t.is_finite() {
+        // NaN/inf can't fire meaningfully, but keep the signature total/deterministic rather than
+        // panicking: map every non-finite threshold to a single sentinel.
+        return 0.0;
+    }
+    let f = 10f64.powi(SIGNATURE_THRESHOLD_DECIMALS);
+    let r = (t * f).round() / f;
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
+}
+
+/// A canonical, ORDER-INDEPENDENT signature for a genome: two genomes that would fire and manage
+/// risk identically map to the same string. It is a stable normalization of
+/// `(side, horizon, sorted normalized predicates (layer, feature_key, op, rounded threshold),
+/// risk model)`.
+///
+/// This is the deduplication key for the search. It is intentionally stronger than
+/// [`se_core::Genome::describe`], which joins predicates in their stored vector order (so the same
+/// conjunction written in a different order yields a different string). Because predicates form a
+/// conjunction, their order does not affect firing; the signature sorts them so it does not affect
+/// the key either. Thresholds are rounded to [`SIGNATURE_THRESHOLD_DECIMALS`] so genomes that
+/// differ only by sub-grid threshold noise (which would fire identically on the empirical grid)
+/// collapse together. Side, horizon and the full risk geometry are included so genuinely different
+/// genomes stay distinct.
+///
+/// Deterministic and side-effect-free; safe to use as a `BTreeSet<String>`/`HashMap` key.
+pub fn genome_signature(genome: &se_core::Genome) -> String {
+    // Normalize each predicate to a canonical, comparable token, then sort so order can't matter.
+    let mut preds: Vec<String> = genome
+        .predicates
+        .iter()
+        .map(|p| {
+            format!(
+                "{}|{}|{}|{:.*}",
+                p.layer.as_str(),
+                p.feature_key,
+                p.op.as_str(),
+                SIGNATURE_THRESHOLD_DECIMALS as usize,
+                round_threshold(p.threshold),
+            )
+        })
+        .collect();
+    preds.sort();
+    format!(
+        "{}::{}::[{}]::{}",
+        genome.side.sign() as i64, // Long=+1, Short=-1: a stable, side-distinguishing token.
+        genome.horizon.as_str(),
+        preds.join("&"),
+        // The risk geometry is part of what fires/manages a trade, so it is part of identity.
+        // `describe` is a stable, human-readable normalization of the full stop/target1/target2.
+        genome.risk.describe(),
+    )
+}
+
 /// Whether a genome carries at least one ACTIONABLE entry condition — a predicate on the
 /// [`Layer::Trigger`] or [`Layer::Location`] layer. Regime / tradeability / event predicates only
 /// *condition* an entry; on their own they fire trivially (e.g. "we're in a bull regime") without
@@ -288,6 +354,129 @@ mod tests {
         assert_eq!(s.recall_oos, 0.41);
         assert_eq!(s.act_threshold, 0.58);
         assert_eq!(s.n_acted_oos, 23);
+    }
+
+    #[test]
+    fn genome_signature_is_order_independent() {
+        use se_core::{CmpOp, Genome, Horizon, Layer, Predicate, Side};
+
+        let p_trigger = Predicate {
+            layer: Layer::Trigger,
+            feature_key: "trigger.rsi14".into(),
+            op: CmpOp::Gt,
+            threshold: 55.0,
+        };
+        let p_regime = Predicate {
+            layer: Layer::Regime,
+            feature_key: "regime.adx".into(),
+            op: CmpOp::Lt,
+            threshold: 20.0,
+        };
+        // Same predicate SET (a conjunction), stored in two different orders.
+        let a = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![p_trigger.clone(), p_regime.clone()],
+        );
+        let b = Genome::new(Side::Long, Horizon::Swing, vec![p_regime, p_trigger]);
+        assert_ne!(
+            a.describe(),
+            b.describe(),
+            "describe is order-DEPENDENT (this is exactly why we need a canonical signature)"
+        );
+        assert_eq!(
+            genome_signature(&a),
+            genome_signature(&b),
+            "signature must be order-independent for the same conjunction"
+        );
+    }
+
+    #[test]
+    fn genome_signature_distinguishes_genuinely_different_genomes() {
+        use se_core::{CmpOp, Genome, Horizon, Layer, Predicate, Side};
+
+        let base = Genome::new(
+            Side::Long,
+            Horizon::Swing,
+            vec![Predicate {
+                layer: Layer::Trigger,
+                feature_key: "trigger.rsi14".into(),
+                op: CmpOp::Gt,
+                threshold: 55.0,
+            }],
+        );
+        let base_sig = genome_signature(&base);
+
+        // Different side.
+        let diff_side = Genome::new(Side::Short, Horizon::Swing, base.predicates.clone());
+        assert_ne!(genome_signature(&diff_side), base_sig, "side must matter");
+
+        // Different horizon (also changes the profile-derived risk, doubly distinct).
+        let diff_horizon = Genome::new(Side::Long, Horizon::Day, base.predicates.clone());
+        assert_ne!(
+            genome_signature(&diff_horizon),
+            base_sig,
+            "horizon must matter"
+        );
+
+        // Different op.
+        let mut lt = base.predicates.clone();
+        lt[0].op = CmpOp::Lt;
+        let diff_op = Genome::new(Side::Long, Horizon::Swing, lt);
+        assert_ne!(genome_signature(&diff_op), base_sig, "op must matter");
+
+        // Materially different threshold (well beyond the rounding grid).
+        let mut thr = base.predicates.clone();
+        thr[0].threshold = 40.0;
+        let diff_thr = Genome::new(Side::Long, Horizon::Swing, thr);
+        assert_ne!(
+            genome_signature(&diff_thr),
+            base_sig,
+            "a materially different threshold must matter"
+        );
+
+        // Different risk geometry, everything else equal.
+        let diff_risk = se_core::Genome::with_risk(
+            Side::Long,
+            Horizon::Swing,
+            base.predicates.clone(),
+            se_core::RiskModel::new(
+                se_core::StopSpec::atr(2.0),
+                se_core::TargetSpec::r_multiple(4.0),
+                None,
+            ),
+        );
+        assert_ne!(
+            genome_signature(&diff_risk),
+            base_sig,
+            "risk geometry must matter"
+        );
+    }
+
+    #[test]
+    fn genome_signature_collapses_subgrid_threshold_noise() {
+        use se_core::{CmpOp, Genome, Horizon, Layer, Predicate, Side};
+
+        let mk = |thr: f64| {
+            Genome::new(
+                Side::Long,
+                Horizon::Swing,
+                vec![Predicate {
+                    layer: Layer::Trigger,
+                    feature_key: "trigger.rsi14".into(),
+                    op: CmpOp::Gt,
+                    threshold: thr,
+                }],
+            )
+        };
+        // Two thresholds equal well below the 4-decimal rounding grid map to the same signature.
+        assert_eq!(
+            genome_signature(&mk(55.000_001)),
+            genome_signature(&mk(55.000_002)),
+            "sub-grid threshold noise must not create a distinct signature"
+        );
+        // A -0.0 threshold must not differ from +0.0.
+        assert_eq!(genome_signature(&mk(-0.0)), genome_signature(&mk(0.0)));
     }
 
     #[test]

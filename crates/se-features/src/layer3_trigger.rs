@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 use se_core::{AsOf, Feature, Layer, LeadTimeTag, Result, Ticker};
 
-use crate::indicators::{atr, obv, roc, rsi, slope_sign, sma};
+use crate::indicators::{atr, ema, obv, roc, rsi, rsi_slope, slope_sign, sma};
 use crate::module::{FeatureContext, FeatureModule};
 
 /// Return/ROC/RS horizon in trading days.
@@ -26,6 +26,14 @@ const ATR_SHORT: usize = 5;
 const ATR_LONG: usize = 20;
 /// RSI period.
 const RSI_PERIOD: usize = 14;
+/// Lookback (bars) for the RSI-slope (momentum-of-momentum) read.
+const RSI_SLOPE_K: usize = 5;
+/// EMA spans for the short/medium/long trend-stack alignment check.
+const EMA_FAST: usize = 9;
+const EMA_MID: usize = 21;
+const EMA_SLOW: usize = 50;
+/// ATR period for the normalized-volatility (ATR%) regime read.
+const ATR_PCT_PERIOD: usize = 14;
 /// OBV slope window.
 const OBV_WINDOW: usize = 20;
 /// NR-window for NR7 (narrowest range of the last 7 bars).
@@ -53,6 +61,41 @@ fn rs_vs_bench(ticker_closes: &[f64], bench_closes: &[f64], n: usize) -> Option<
     let r_t = roc(ticker_closes, n)?;
     let r_b = roc(bench_closes, n)?;
     Some(r_t - r_b)
+}
+
+/// Signed EMA-stack alignment over `closes`: combines the sign of (fast − mid) and
+/// (mid − slow) EMAs into a single trend-agreement score.
+///   * `+1.0` fully bullish stack (fast > mid AND mid > slow),
+///   * `-1.0` fully bearish stack (fast < mid AND mid < slow),
+///   * `0.0`  mixed/flat (the two spreads disagree or either is exactly zero).
+///
+/// Each EMA is evaluated on the SAME oldest-first `closes` slice ending at the
+/// decision bar, so the alignment reflects only information available at that bar.
+/// `None` if any EMA can't be formed (empty series).
+fn ema_stack_align(closes: &[f64], fast: usize, mid: usize, slow: usize) -> Option<f64> {
+    let ef = ema(closes, fast)?;
+    let em = ema(closes, mid)?;
+    let es = ema(closes, slow)?;
+    let s1 = (ef - em).signum_or_zero();
+    let s2 = (em - es).signum_or_zero();
+    // Average of the two spread signs: ±1 only when both agree, 0 when they don't.
+    Some((s1 + s2) / 2.0)
+}
+
+/// Helper: sign of a float, but 0.0 (not ±1) for exactly-zero / non-finite inputs.
+trait SignumOrZero {
+    fn signum_or_zero(self) -> f64;
+}
+impl SignumOrZero for f64 {
+    fn signum_or_zero(self) -> f64 {
+        if self > 0.0 {
+            1.0
+        } else if self < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    }
 }
 
 /// NR7: 1.0 if the LAST bar's range is the narrowest of the last `window` bars.
@@ -186,6 +229,28 @@ impl FeatureModule for TriggerModule {
             push(&mut out, "trigger.rsi14", r, "derived");
         }
 
+        // --- RSI slope (momentum of momentum): ΔRSI(14) over the last k bars -
+        // Reads only `closes`; the lagged RSI is taken on the strict prefix
+        // closes[..len-k], so it cannot peek past the decision bar.
+        if let Some(rs) = rsi_slope(&closes, RSI_PERIOD, RSI_SLOPE_K) {
+            push(&mut out, "trigger.rsi_slope", rs, "derived");
+        }
+
+        // --- EMA stack alignment: signed agreement of 9/21/50 EMAs -------
+        // All three EMAs are evaluated on the same `closes` slice ending at the
+        // decision bar; the value is a trend-alignment score in {-1, -0.5, 0, 0.5, 1}.
+        if let Some(a) = ema_stack_align(&closes, EMA_FAST, EMA_MID, EMA_SLOW) {
+            push(&mut out, "trigger.ema_stack_align", a, "derived");
+        }
+
+        // --- ATR% : ATR(14) / close, the entry bar's normalized vol regime ---
+        if let Some(a) = atr(&bars, ATR_PCT_PERIOD) {
+            let c = *closes.last().unwrap();
+            if c > 0.0 {
+                push(&mut out, "trigger.atr_pct", a / c, "derived");
+            }
+        }
+
         // --- OBV trend (slope sign over N) -------------------------------
         let obv_series = obv(&bars);
         if obv_series.len() >= OBV_WINDOW {
@@ -270,6 +335,27 @@ mod tests {
         assert_eq!(nr7(&ranges2, 7), Some(0.0));
         // Too few bars -> None.
         assert_eq!(nr7(&[1.0, 2.0], 7), None);
+    }
+
+    #[test]
+    fn ema_stack_align_bull_bear_mixed() {
+        // Steady uptrend: fast EMA above mid above slow -> fully bullish (+1).
+        let up: Vec<f64> = (0..60).map(|i| 100.0 + i as f64).collect();
+        assert_eq!(ema_stack_align(&up, 9, 21, 50), Some(1.0));
+
+        // Steady downtrend: fast below mid below slow -> fully bearish (-1).
+        let down: Vec<f64> = (0..60).map(|i| 200.0 - i as f64).collect();
+        assert_eq!(ema_stack_align(&down, 9, 21, 50), Some(-1.0));
+
+        // A long flat tail after an early ramp: spreads collapse toward 0, so the
+        // score is in [-1, 1] and not the fully-bullish +1.
+        let mut chop: Vec<f64> = (0..30).map(|i| 100.0 + i as f64).collect();
+        chop.extend(std::iter::repeat(130.0).take(40));
+        let a = ema_stack_align(&chop, 9, 21, 50).unwrap();
+        assert!((-1.0..=1.0).contains(&a), "alignment bounded, got {a}");
+
+        // Empty series -> None.
+        assert_eq!(ema_stack_align(&[], 9, 21, 50), None);
     }
 
     #[test]

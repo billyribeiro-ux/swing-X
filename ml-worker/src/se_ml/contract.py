@@ -36,7 +36,8 @@ POST /validate
         "regime_contrib": {"bull": 0.06, "bear": 0.01, "chop": 0.03},
         "n_regimes_positive": 3, "passed_gate": true,
         "precision_oos": 0.58, "recall_oos": 0.41,
-        "act_threshold": 0.62, "n_acted_oos": 73}
+        "act_threshold": 0.62, "n_acted_oos": 73,
+        "precision_forward": 0.55, "expectancy_forward": 0.03, "n_forward": 31}
 
 POST /calibrate
     CalibrateRequest:
@@ -143,6 +144,20 @@ class ValidateResult(_Strict):
     )
     n_acted_oos: int = Field(
         ..., description="Number of OOS-reporting-half trades acted on at tau*."
+    )
+    # STRICT time-ordered forward-holdout durability (reported, NOT gating): the selected
+    # config is refit on the earliest 70% of the timeline and judged on the latest 30%.
+    # Separates a real edge from regime-fitting that CPCV's shuffled folds can mask.
+    precision_forward: float = Field(
+        ...,
+        description="P(profit|acted) on the latest-30% forward holdout (fit on earliest 70%).",
+    )
+    expectancy_forward: float = Field(
+        ...,
+        description="Mean cost-aware R over acted forward-holdout rows (0.0 if none acted).",
+    )
+    n_forward: int = Field(
+        ..., description="Number of forward-holdout trades acted on (0 if degenerate/empty)."
     )
 
 

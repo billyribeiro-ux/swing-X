@@ -43,7 +43,10 @@ pub use population::{
 pub use risk_search::RiskSpace;
 pub use rng::Rng;
 pub use score::{
-    genome_has_actionable_predicate, score_oos, OosScore, ScoreConfig, MIN_ACTED_TO_PROMOTE,
-    MIN_ENTRIES_TO_VALIDATE,
+    genome_has_actionable_predicate, genome_signature, score_oos, OosScore, ScoreConfig,
+    MIN_ACTED_TO_PROMOTE, MIN_ENTRIES_TO_VALIDATE,
 };
-pub use seed::{layer_of_key, random_genome, seed_population, FeatureCatalog, FeatureStat};
+pub use seed::{
+    archetype_seeds, draw_predicate_in_layers, layer_of_key, random_genome, seed_population,
+    seed_population_biased, FeatureCatalog, FeatureStat, DEFAULT_PROMOTABLE_BIAS,
+};
