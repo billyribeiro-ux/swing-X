@@ -112,6 +112,17 @@ pub struct SearchConfig {
     /// [`SearchConfig::new`] get the default automatically; values `<= 1.0` reproduce the legacy
     /// (per_gen-sized) pool.
     pub offspring_pool_mult: f64,
+    /// A LOCKED out-of-time TEST ERA `[from, to]` (inclusive, session-close UTC) that is
+    /// FIREWALLED out of this search's training dataset: any labeled entry whose decision bar
+    /// (`ts`) OR whose label-window end (`t1`) falls inside it is purged before scoring
+    /// (see [`PopulationManager::build_dataset`] / [`firewall_test_era`]). Purging by `t1` is what
+    /// makes it leak-safe — a label entered BEFORE the era but resolving inside it would otherwise
+    /// leak reserved-era outcome into training.
+    ///
+    /// `None` (the default via [`SearchConfig::new`]) => no reservation, behavior identical to
+    /// before. This is REPORT-ONLY infrastructure: it only ever REMOVES rows from the dataset; it
+    /// NEVER feeds rank_key/gate/survivor selection/nightly scoring or any promotion decision.
+    pub test_era: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 }
 
 /// Default deterministic search seed (never derived from the clock — see [`crate::rng`]).
@@ -141,6 +152,9 @@ impl SearchConfig {
             lock_risk: false,
             scanner: Scanner::Etf,
             offspring_pool_mult: DEFAULT_OFFSPRING_POOL_MULT,
+            // No out-of-time reservation by default: the firewall is a no-op until the operator
+            // sets SE_TEST_FROM/SE_TEST_TO, so existing searches are unchanged.
+            test_era: None,
         }
     }
 }
@@ -212,15 +226,31 @@ impl<'a> PopulationManager<'a> {
 
     /// Backtest a genome across the whole universe and assemble one combined dataset (entries
     /// from all tickers, re-sorted ascending by entry time as the writer requires).
+    ///
+    /// OUT-OF-TIME TEST-ERA FIREWALL: when `cfg.test_era` is set, every assembled row whose
+    /// decision bar OR whose label end `t1` falls inside the reserved era is purged here
+    /// (see [`firewall_test_era`]) so NO row that touches the reservation can reach OOS scoring,
+    /// ranking, the gate, survivor selection, or nightly. When it is `None` this is a no-op and
+    /// the dataset is exactly the legacy dataset.
     fn build_dataset(&self, genome: &Genome) -> (Vec<se_mlclient::DatasetRow>, usize) {
         let mut all = Vec::new();
+        let mut purged = 0usize;
         for w in &self.windows {
             let res = backtest(genome, w, &self.cfg.profile);
             let rows = assemble(&res);
-            all.extend(rows);
+            let (kept, n_purged) = firewall_test_era(rows, self.cfg.test_era);
+            purged += n_purged;
+            all.extend(kept);
         }
         all.sort_by(|a, b| a.ts.cmp(&b.ts));
         let n = all.len();
+        if purged > 0 {
+            tracing::debug!(
+                purged,
+                kept = n,
+                "test-era firewall purged labeled rows touching the reserved out-of-time era"
+            );
+        }
         (all, n)
     }
 
@@ -542,6 +572,43 @@ impl<'a> PopulationManager<'a> {
     }
 }
 
+/// Apply the OUT-OF-TIME TEST-ERA FIREWALL to a genome's assembled dataset rows.
+///
+/// When `era` is `Some((from, to))`, drop every row whose **decision/entry bar** (`ts`) OR whose
+/// **label-window** `[ts, t1]` OVERLAPS the inclusive reserved window `[from, to]` — the interval
+/// predicate `ts <= to AND t1 >= from ⇒ exclude`. Overlap (not just endpoint membership) is
+/// essential: a label entered BEFORE `from` but resolving (`t1`) inside — or straddling — the era
+/// would otherwise leak reserved-era outcome into training. When `era` is `None`, the rows pass
+/// through untouched (legacy behavior).
+///
+/// Returns `(kept_rows, n_purged)`. This is a pure filter used only to build the training dataset;
+/// it NEVER influences ranking, the gate, survivor selection, promotion, or nightly scoring — it
+/// only removes rows so the reservation stays a never-touched selection-bias meter.
+fn firewall_test_era(
+    rows: Vec<se_mlclient::DatasetRow>,
+    era: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> (Vec<se_mlclient::DatasetRow>, usize) {
+    let Some((from, to)) = era else {
+        return (rows, 0);
+    };
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut purged = 0usize;
+    for row in rows {
+        // Exclude iff the label's holding span [ts, t1] OVERLAPS the reserved era [from, to]:
+        // `ts <= to && t1 >= from`. This interval-overlap test is stricter than endpoint
+        // membership — it also catches a label that STRADDLES the whole era (entry before `from`,
+        // resolution after `to`), which `decision_ts ∈ era OR t1 ∈ era` would miss. `ts` is the
+        // decision/entry bar; `t1` is the barrier-end (label resolution).
+        let overlaps_era = row.ts <= to && row.t1 >= from;
+        if overlaps_era {
+            purged += 1;
+        } else {
+            kept.push(row);
+        }
+    }
+    (kept, purged)
+}
+
 /// Attempt to admit one candidate genome into a deduplicated set. Returns `true` (and pushes `g`
 /// onto `out`) iff its canonical [`genome_signature`] was not already in `seen`; otherwise returns
 /// `false` and leaves `out` untouched. `seen` accumulates every admitted (and pre-seeded)
@@ -658,6 +725,9 @@ mod tests {
         let cfg = SearchConfig::new(se_core::HorizonProfile::swing(), vec![Ticker::SPY]);
         assert_eq!(cfg.offspring_pool_mult, DEFAULT_OFFSPRING_POOL_MULT);
         assert!(cfg.offspring_pool_mult >= 1.0);
+        // Backward-compatible: no out-of-time reservation unless the operator sets one, so the
+        // firewall is a no-op for callers that construct via `new()`.
+        assert!(cfg.test_era.is_none());
     }
 
     #[test]
@@ -812,5 +882,97 @@ mod tests {
         let fresh = Genome::new(Side::Short, Horizon::Day, vec![pred(Layer::Location)]);
         assert!(admit_unique(fresh, &mut seen, &mut kept));
         assert_eq!(kept.len(), 1);
+    }
+
+    // ---- out-of-time TEST-ERA firewall ---------------------------------------
+
+    use chrono::{DateTime, TimeZone, Utc};
+    use se_mlclient::DatasetRow;
+
+    /// A dataset row with an explicit decision bar (`ts`) and label end (`t1`), days offset from
+    /// a reference instant.
+    fn era_row(entry: DateTime<Utc>, t1: DateTime<Utc>) -> DatasetRow {
+        DatasetRow {
+            ts: entry,
+            t1,
+            label: 0.0,
+            regime: None,
+            features: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn day(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
+    }
+
+    #[test]
+    fn test_era_firewall_purges_decision_and_t1_membership() {
+        // Reserved out-of-time era [from, to].
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 21, 0, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2025, 3, 31, 21, 0, 0).unwrap();
+        let era = Some((from, to));
+
+        // (a) fully BEFORE the era (both decision and t1 before `from`) -> KEPT.
+        let clean_before = era_row(from - day(100), from - day(90));
+        // (b) PLANTED future-membership: the decision bar is BEFORE `from`, but the label RESOLVES
+        //     (t1) inside the era. This is precisely the leak the t1-purge exists to catch and it
+        //     MUST be excluded (a plain entry-ts firewall would wrongly keep it).
+        let resolves_in_era = era_row(from - day(2), from + day(5));
+        // (c) decision bar INSIDE the era -> PURGED (entry-membership).
+        let decision_in_era = era_row(from + day(10), to + day(2));
+        // (d) fully AFTER the era -> KEPT.
+        let clean_after = era_row(to + day(10), to + day(15));
+
+        let rows = vec![
+            clean_before.clone(),
+            resolves_in_era,
+            decision_in_era,
+            clean_after.clone(),
+        ];
+        let (kept, purged) = firewall_test_era(rows, era);
+
+        assert_eq!(
+            purged, 2,
+            "the t1-in-era (planted) row and the decision-in-era row must both be purged"
+        );
+        assert_eq!(
+            kept.len(),
+            2,
+            "only the fully-before and fully-after rows survive"
+        );
+        assert!(
+            kept.iter().any(|r| r.ts == clean_before.ts),
+            "the clean pre-era row is retained"
+        );
+        assert!(
+            kept.iter().any(|r| r.ts == clean_after.ts),
+            "the clean post-era row is retained"
+        );
+        // The invariant: no surviving row's decision bar OR label end lies inside the reservation.
+        for r in &kept {
+            assert!(
+                !(r.ts >= from && r.ts <= to),
+                "no kept row's decision bar may fall inside the reserved era"
+            );
+            assert!(
+                !(r.t1 >= from && r.t1 <= to),
+                "no kept row's label end t1 may fall inside the reserved era"
+            );
+        }
+    }
+
+    #[test]
+    fn test_era_firewall_is_noop_when_unset() {
+        // With NO reservation, the firewall must pass every row through unchanged — the
+        // backward-compatible default that keeps existing searches identical.
+        let base = Utc.with_ymd_and_hms(2025, 1, 1, 21, 0, 0).unwrap();
+        let rows = vec![
+            era_row(base, base + day(5)),
+            era_row(base + day(10), base + day(15)),
+        ];
+        let n = rows.len();
+        let (kept, purged) = firewall_test_era(rows, None);
+        assert_eq!(purged, 0, "no reservation => nothing is ever purged");
+        assert_eq!(kept.len(), n, "all rows pass through untouched");
     }
 }

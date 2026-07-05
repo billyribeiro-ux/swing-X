@@ -2544,6 +2544,7 @@ dependencies = [
 name = "se-config"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "se-core",
  "serde",
  "tracing",

@@ -116,6 +116,13 @@ pub async fn run_search(
     search_cfg.risk = risk;
     search_cfg.lock_risk = lock_risk;
     search_cfg.scanner = cfg.scanner;
+    // LOCKED out-of-time TEST ERA (report-only reservation): convert the config's reservation
+    // dates to the repo's session-close UTC convention and hand them to the search's FIREWALL.
+    // The firewall PURGES any labeled row whose decision bar or label end `t1` falls inside the
+    // era so it can never reach scoring/ranking. `None` => no reservation (unchanged behavior).
+    search_cfg.test_era = cfg
+        .test_era()
+        .map(|(f, t)| (session_close(f), session_close(t)));
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
@@ -139,6 +146,15 @@ pub async fn run_search(
             "EXPLORED (search optimizes risk geometry on the OOS scoreboard)"
         }
     );
+    match cfg.test_era() {
+        Some((f, t)) => println!(
+            "out-of-time TEST ERA: {f} → {t} FIREWALLED (purged by decision-bar AND label t1; \
+             report-only — never feeds ranking/gate/promotion/nightly)"
+        ),
+        None => println!(
+            "out-of-time TEST ERA: none reserved (set SE_TEST_FROM/SE_TEST_TO to firewall a window)"
+        ),
+    }
 
     println!("materializing per-bar feature windows across the universe (one-time) ...");
     use std::io::Write as _;
