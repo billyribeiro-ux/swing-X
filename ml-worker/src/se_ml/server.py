@@ -45,6 +45,7 @@ from .io_arrow import (
     split_features_labels,
 )
 from .labeling.meta_labeling import make_meta_labels
+from .labeling.uniqueness import average_uniqueness, effective_n
 from .models.gbm import GbmModel, fit_gbm
 from .stats import metrics as mx
 from .stats.dsr import deflated_sharpe_ratio
@@ -149,12 +150,35 @@ def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str,
     return grid
 
 
+def _uniqueness_weights(
+    ts: np.ndarray | None,
+    t1: np.ndarray | None,
+    train_idx: np.ndarray,
+) -> np.ndarray | None:
+    """Average-uniqueness sample weights for the TRAIN rows ``train_idx``, or ``None``.
+
+    Overlapping triple-barrier labels are not iid, so a raw fit over-weights concurrent
+    (redundant) rows. Weighting each training row by its Lopez de Prado average uniqueness
+    restores honesty about the effective sample size. Returns ``None`` when ``ts``/``t1`` are
+    unavailable (so the fit stays unweighted) and never raises — a weighting failure must
+    never crash a validation run.
+    """
+    if ts is None or t1 is None:
+        return None
+    try:
+        return average_uniqueness(np.asarray(ts)[train_idx], np.asarray(t1)[train_idx])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
 def _oos_proba_for_trial(
     X: pd.DataFrame,
     y_np: np.ndarray,
     splits: list,
     params: dict[str, object],
     seed: int,
+    ts: np.ndarray | None = None,
+    t1: np.ndarray | None = None,
 ) -> np.ndarray:
     """Full-timeline OOS per-observation probabilities for one trial, via CPCV.
 
@@ -162,6 +186,12 @@ def _oos_proba_for_trial(
     rows that never appear in any test fold are ``np.nan``. The trial's feature subset
     (``params['_features']``) restricts the model's inputs. This is the raw probability layer
     on top of which an acting threshold tau is applied.
+
+    SINGLE-PATH: with combinatorial CPCV a row can land in several test folds; this keeps only
+    the LAST-written fold's probability (order-dependent). When ``ts``/``t1`` are supplied each
+    per-fold fit is weighted by the training rows' average uniqueness (overlapping-label
+    honesty); passing ``None`` (the default) leaves the fit unweighted and byte-identical to
+    the legacy behavior.
     """
     model_params = {k: v for k, v in params.items() if not k.startswith("_")}
     features = params.get("_features")
@@ -170,10 +200,58 @@ def _oos_proba_for_trial(
     for sp in splits:
         if sp.train_idx.size == 0 or sp.test_idx.size == 0:
             continue
+        sw = _uniqueness_weights(ts, t1, sp.train_idx)
         model = fit_gbm(
-            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params,
+            sample_weight=sw,
         )
         out[sp.test_idx] = model.predict_proba(Xf.iloc[sp.test_idx])
+    return out
+
+
+def _oos_proba_path_averaged(
+    X: pd.DataFrame,
+    y_np: np.ndarray,
+    splits: list,
+    params: dict[str, object],
+    seed: int,
+    ts: np.ndarray | None = None,
+    t1: np.ndarray | None = None,
+) -> np.ndarray:
+    """PATH-AVERAGED OOS per-observation probabilities for one trial, via CPCV.
+
+    Combinatorial CPCV (``n_groups`` choose ``k``) holds each row out in MULTIPLE test folds.
+    :func:`_oos_proba_for_trial` keeps only the last fold's probability per row, collapsing the
+    combinatorial design to a single (order-dependent) path and discarding its variance
+    reduction. This function instead AVERAGES each row's probability over ALL folds that hold
+    it out — accumulating a per-row sum + count across splits, then dividing. Rows never tested
+    stay ``np.nan``. The result is order-invariant (stable across ``splits`` orderings) and
+    lower-variance, which is why the selected config's tau*/precision/expectancy reporting uses
+    it (while the PBO matrix + IS selection keep the single-path returns — see
+    :func:`_oos_returns_for_trial`).
+
+    When ``ts``/``t1`` are supplied each per-fold fit is uniqueness-weighted, exactly as in the
+    single-path variant.
+    """
+    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
+    features = params.get("_features")
+    Xf = X[features] if isinstance(features, list) else X
+    n = len(X)
+    psum = np.zeros(n, dtype=np.float64)
+    pcount = np.zeros(n, dtype=np.float64)
+    for sp in splits:
+        if sp.train_idx.size == 0 or sp.test_idx.size == 0:
+            continue
+        sw = _uniqueness_weights(ts, t1, sp.train_idx)
+        model = fit_gbm(
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params,
+            sample_weight=sw,
+        )
+        psum[sp.test_idx] += model.predict_proba(Xf.iloc[sp.test_idx])
+        pcount[sp.test_idx] += 1.0
+    out = np.full(n, np.nan, dtype=np.float64)
+    tested = pcount > 0
+    out[tested] = psum[tested] / pcount[tested]
     return out
 
 
@@ -386,6 +464,7 @@ def forward_holdout_precision(
     params: dict[str, object],
     cost: float,
     seed: int,
+    t1: np.ndarray | None = None,
 ) -> tuple[float, float, int]:
     """Strict TIME-ORDERED forward-holdout precision/expectancy for the selected config.
 
@@ -419,6 +498,8 @@ def forward_holdout_precision(
     order = np.argsort(ts, kind="stable")
     X_ord = X.iloc[order].reset_index(drop=True)
     y_ord = np.asarray(y, dtype=np.float64)[order]
+    ts_ord = np.asarray(ts)[order]
+    t1_ord = np.asarray(t1)[order] if t1 is not None else None
 
     cut = int(np.floor(0.70 * n))
     if cut <= 0 or cut >= n:
@@ -432,8 +513,10 @@ def forward_holdout_precision(
     X_train, X_hold = Xf.iloc[:cut], Xf.iloc[cut:]
     y_train, y_hold = y_ord[:cut], y_ord[cut:]
 
-    # Fit the primary model on TRAIN only, predict on HOLDOUT.
-    model = fit_gbm(X_train, y_train, seed=seed, params=model_params)
+    # Fit the primary model on TRAIN only (uniqueness-weighted when t1 is available so the
+    # forward fit is honest about overlapping labels), predict on HOLDOUT.
+    train_w = _uniqueness_weights(ts_ord, t1_ord, np.arange(cut))
+    model = fit_gbm(X_train, y_train, seed=seed, params=model_params, sample_weight=train_w)
     proba_train = model.predict_proba(X_train)
     proba_hold = model.predict_proba(X_hold)
 
@@ -487,9 +570,14 @@ def validate(req: ValidateRequest) -> ValidateResult:
     y_np = y.to_numpy()
     fs = req.fold_spec
 
+    # Event/barrier times drive both the CPCV purge AND the overlapping-label sample-uniqueness
+    # weights fed into every training fit + the effective-N behind DSR.
+    ts_all = df[TS_COL].to_numpy()
+    t1_all = df[T1_COL].to_numpy()
+
     splits = cpcv_splits(
-        event_ts=df[TS_COL].to_numpy(),
-        t1=df[T1_COL].to_numpy(),
+        event_ts=ts_all,
+        t1=t1_all,
         n_groups=fs.n_groups,
         k_test_groups=fs.k_test_groups,
         embargo_bars=fs.embargo_bars,
@@ -513,8 +601,15 @@ def validate(req: ValidateRequest) -> ValidateResult:
 
     # Precision/threshold layer on the SELECTED config. Recover its raw per-row OOS
     # probabilities across the full timeline (np.nan where a row never appeared in a test
-    # fold) so we can choose an acting threshold tau* instead of the hardcoded 0.5.
-    proba = _oos_proba_for_trial(X, y_np, splits, grid[best], seed=1000 + best)
+    # fold) so we can choose an acting threshold tau* instead of the hardcoded 0.5. We use the
+    # PATH-AVERAGED probability (mean over every CPCV fold that holds a row out) rather than the
+    # single last-write path: it recovers the combinatorial design's variance reduction and is
+    # order-invariant. Each per-fold fit is uniqueness-weighted (overlapping-label honesty).
+    # NOTE: the PBO matrix + IS selection above deliberately keep the single-path,
+    # unweighted returns (see _oos_returns_for_trial) — path-averaging must not touch them.
+    proba = _oos_proba_path_averaged(
+        X, y_np, splits, grid[best], seed=1000 + best, ts=ts_all, t1=t1_all
+    )
     idx = np.arange(t)
     finite = ~np.isnan(proba)
     is_mask = (idx < mid) & finite
@@ -555,7 +650,13 @@ def validate(req: ValidateRequest) -> ValidateResult:
         raise HTTPException(status_code=422, detail="no OOS observations produced by CPCV")
 
     cost_aware = mx.cost_aware_returns(realized, DEFAULT_COST_PER_TRADE_R)
-    dsr = deflated_sharpe_ratio(cost_aware, n_trials=max(1, req.n_trials))
+    # Overlapping labels are not iid, so the nominal acted-row count overstates significance.
+    # Feed DSR the EFFECTIVE-N of the tau*-acted OOS series (Kish size over its average-
+    # uniqueness weights) so the deflation uses the honest sample size, not the inflated one.
+    acted_eff_n = effective_n(average_uniqueness(ts_all[row_mask], t1_all[row_mask]))
+    dsr = deflated_sharpe_ratio(
+        cost_aware, n_trials=max(1, req.n_trials), effective_n=acted_eff_n
+    )
 
     # PBO via CSCV on the full trial matrix (needs >= 2 trials).
     if trial_returns.shape[1] >= 2:
@@ -587,10 +688,11 @@ def validate(req: ValidateRequest) -> ValidateResult:
         precision_forward, expectancy_forward, n_forward = forward_holdout_precision(
             X,
             y_np,
-            df[TS_COL].to_numpy(),
+            ts_all,
             grid[best],
             DEFAULT_COST_PER_TRADE_R,
             seed=1000 + best,
+            t1=t1_all,
         )
     except (ValueError, KeyError):
         precision_forward, expectancy_forward, n_forward = 0.0, 0.0, 0
