@@ -219,11 +219,15 @@ def _threshold_stats(
     """Acting stats for ``tau`` on one (proba, r) fold.
 
     Returns ``(n_acted, precision, recall, expectancy)`` where precision is the fraction of
-    acted rows that are profitable (``make_meta_labels`` R > 0), recall is
-    #acted-and-profitable / #profitable, and expectancy is the cost-aware mean R over acted
-    rows (``-inf`` when nothing acted, so it never beats a real candidate on tie-breaks).
+    acted rows that are NET-profitable (``make_meta_labels`` R > ``cost``), recall is
+    #acted-and-net-profitable / #net-profitable, and expectancy is the cost-aware mean R over
+    acted rows (``-inf`` when nothing acted, so it never beats a real candidate on tie-breaks).
+
+    Profitability is measured NET of the round-trip cost so that "precision" is P(net profit |
+    acted), not the cost-blind P(R>0) — a 0<R<cost trade is a net loss and must NOT count as a
+    precision win (else the shipped conviction + live floor pass net-negative setups).
     """
-    labels = make_meta_labels(r)
+    labels = make_meta_labels(r, cost)
     n_profit = int(labels.sum())
     acted = proba >= tau
     n_acted = int(acted.sum())
@@ -349,20 +353,23 @@ def precision_recall_at(
     proba: np.ndarray,
     r: np.ndarray,
     tau: float,
+    cost: float,
 ) -> tuple[float, float, int]:
     """Precision, recall and acted-count for acting at threshold ``tau``.
 
     ``proba`` and ``r`` are same-length finite-proba arrays (probability and realized R).
     Acted = ``proba >= tau``. Returns ``(precision, recall, n_acted)`` where:
 
-      * precision = fraction of ACTED trades that were profitable (R > 0); 0.0 if none acted.
-      * recall    = #acted-and-profitable / #profitable opportunities; 0.0 if no profit rows.
+      * precision = fraction of ACTED trades that were NET-profitable (R > ``cost``); 0.0 if
+        none acted.
+      * recall    = #acted-and-net-profitable / #net-profitable opportunities; 0.0 if none.
       * n_acted   = number of acted rows.
 
-    Profitability labels come from :func:`make_meta_labels` (R > 0), keeping the live path's
-    notion of "win" consistent with the staged meta-labeling module.
+    Profitability is NET of the round-trip ``cost`` (``make_meta_labels(r, cost)``): a trade
+    with 0<R<cost is a net loss, so the north-star P(profit | acted) is P(NET profit | acted),
+    not the cost-blind win rate. This is the number that becomes the live conviction + floor.
     """
-    labels = make_meta_labels(r)
+    labels = make_meta_labels(r, cost)
     acted = proba >= tau
     n_acted = int(acted.sum())
     n_profit = int(labels.sum())
@@ -432,7 +439,7 @@ def forward_holdout_precision(
 
     # Select tau* on TRAIN (no HOLDOUT peeking), then measure on HOLDOUT.
     tau = select_act_threshold(proba_train, y_train, cost)
-    precision, _recall, n_acted = precision_recall_at(proba_hold, y_hold, tau)
+    precision, _recall, n_acted = precision_recall_at(proba_hold, y_hold, tau, cost)
     if n_acted == 0:
         return 0.0, 0.0, 0
 
@@ -520,9 +527,10 @@ def validate(req: ValidateRequest) -> ValidateResult:
         proba[is_mask], y_np[is_mask], DEFAULT_COST_PER_TRADE_R
     )
 
-    # Measure precision/recall on the OOS half at tau*.
+    # Measure precision/recall on the OOS half at tau*. Precision is NET of cost (P(net profit
+    # | acted)) — a sub-cost winner (0<R<cost) is a net loss, not a precision win.
     precision_oos, recall_oos, n_acted_oos = precision_recall_at(
-        proba[oos_mask], y_np[oos_mask], act_threshold
+        proba[oos_mask], y_np[oos_mask], act_threshold, DEFAULT_COST_PER_TRADE_R
     )
 
     # The whole gate is precision-optimized: feed the tau*-acted OOS realized returns as the
