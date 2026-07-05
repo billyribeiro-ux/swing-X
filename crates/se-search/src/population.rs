@@ -24,8 +24,9 @@ use crate::feature_matrix::{build_window, FeatureWindow};
 use crate::risk_search::RiskSpace;
 use crate::rng::Rng;
 use crate::score::{
-    genome_has_actionable_predicate, genome_signature, score_oos, OosScore, ScoreConfig,
-    MIN_ACTED_TO_PROMOTE, MIN_ENTRIES_TO_VALIDATE,
+    genome_has_actionable_predicate, genome_signature, score_oos, wilson_lower_bound, OosScore,
+    ScoreConfig, MIN_ACTED_TO_PROMOTE, MIN_ENTRIES_TO_VALIDATE, MIN_PROMOTE_PRECISION_LB,
+    WILSON_Z_95,
 };
 use crate::seed::{seed_population, FeatureCatalog};
 use crate::{genome_ops, persist};
@@ -62,6 +63,11 @@ impl Evaluated {
                 s.passed_gate
                     && genome_has_actionable_predicate(&self.strategy.genome)
                     && s.n_acted_oos as usize >= MIN_ACTED_TO_PROMOTE
+                    // Optimizer's-curse guard: the (net-of-cost) precision's Wilson lower bound —
+                    // not the point estimate — must clear the floor, so a small-n high-precision
+                    // fluke cannot be promoted on sampling luck.
+                    && wilson_lower_bound(s.precision_oos, s.n_acted_oos, WILSON_Z_95)
+                        >= MIN_PROMOTE_PRECISION_LB
             }
             None => false,
         }
@@ -680,11 +686,32 @@ mod tests {
             Horizon::Swing,
             vec![pred(Layer::Regime), pred(Layer::Trigger)],
         );
-        let v = passing_validation(MIN_ACTED_TO_PROMOTE as i64);
+        // A LARGE acted cohort so the 0.70 precision's Wilson lower bound (~0.58) clears the
+        // MIN_PROMOTE_PRECISION_LB floor: a genuine, sampling-robust edge is promotable.
+        let v = passing_validation(60);
         let ev = evaluated(genome, &v);
         assert!(
             ev.promotable(),
-            "trigger + sufficient n_acted must be promotable"
+            "trigger + large acted cohort with a robust precision LB must be promotable"
+        );
+    }
+
+    #[test]
+    fn small_n_high_precision_fluke_is_not_promotable() {
+        // The optimizer's-curse case: precision 0.70 but only n=8 acted. It clears the hard gate
+        // and the MIN_ACTED floor, yet the Wilson lower bound (~0.37) is below the LB floor — a
+        // small-sample fluke the search would otherwise promote. Must be held back (but survive).
+        let genome = Genome::new(Side::Long, Horizon::Swing, vec![pred(Layer::Trigger)]);
+        let v = passing_validation(MIN_ACTED_TO_PROMOTE as i64); // 8 acted, precision 0.70
+        let ev = evaluated(genome, &v);
+        assert!(ev.score.as_ref().unwrap().passed_gate);
+        assert!(
+            !ev.promotable(),
+            "a high-precision but tiny-n cohort must fail the Wilson lower-bound gate"
+        );
+        assert!(
+            ev.survives(),
+            "but it is still kept as a survivor to mutate"
         );
     }
 

@@ -29,6 +29,36 @@ pub const MIN_ENTRIES_TO_VALIDATE: usize = 40;
 /// promotions. See [`crate::population`].
 pub const MIN_ACTED_TO_PROMOTE: usize = 8;
 
+/// z for a one-sided ~95% Wilson lower bound on a binomial proportion.
+pub const WILSON_Z_95: f64 = 1.96;
+
+/// The minimum WILSON LOWER BOUND on OOS precision a genome must clear to be promoted. Gating on
+/// the point estimate is textbook optimizer's-curse: the search maximizes precision over many
+/// genomes on tiny acted cohorts, so a "best 0.73 on n=8" is statistically consistent with the
+/// ~0.5 mean (Wilson half-width ≈ ±0.25-0.30). Requiring the *lower bound* of the (net-of-cost)
+/// precision interval to clear this floor keeps only genomes whose edge survives sampling
+/// uncertainty — a large-n 0.55 passes, a small-n 0.73 fluke does not. Tune jointly with history
+/// depth (a strict floor on a shallow single-regime window can starve promotions).
+pub const MIN_PROMOTE_PRECISION_LB: f64 = 0.45;
+
+/// One-sided Wilson score-interval lower bound for a binomial proportion `p` observed over `n`
+/// trials, at confidence `z` (see [`WILSON_Z_95`]). Unlike the raw `p ± z·SE` Wald interval, the
+/// Wilson bound is well-behaved for small `n` and near 0/1 — exactly the tiny-cohort regime where
+/// the search's best-of-many precision is most optimistically biased. Returns `0.0` for `n <= 0`
+/// (no evidence) and clamps to `[0, 1]`.
+pub fn wilson_lower_bound(p: f64, n: i64, z: f64) -> f64 {
+    if n <= 0 || !p.is_finite() {
+        return 0.0;
+    }
+    let n = n as f64;
+    let p = p.clamp(0.0, 1.0);
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((centre - margin) / denom).clamp(0.0, 1.0)
+}
+
 /// An out-of-sample score for one strategy. The ONLY sortable summary the search keeps.
 ///
 /// Constructed only from OOS validation output + the gate. The fields below are all OOS or
@@ -522,5 +552,36 @@ mod tests {
         // A location predicate -> actionable.
         let with_location = Genome::new(Side::Long, Horizon::Swing, vec![pred(Layer::Location)]);
         assert!(genome_has_actionable_predicate(&with_location));
+    }
+
+    #[test]
+    fn wilson_lower_bound_penalizes_small_n_and_tightens_with_n() {
+        // Degenerate / no-evidence inputs.
+        assert_eq!(wilson_lower_bound(0.7, 0, WILSON_Z_95), 0.0);
+        assert_eq!(wilson_lower_bound(f64::NAN, 100, WILSON_Z_95), 0.0);
+
+        // The lower bound is always <= the point estimate, and rises toward it as n grows.
+        let lb_small = wilson_lower_bound(0.7, 8, WILSON_Z_95);
+        let lb_big = wilson_lower_bound(0.7, 400, WILSON_Z_95);
+        assert!(lb_small < 0.7 && lb_big < 0.7);
+        assert!(
+            lb_big > lb_small,
+            "more evidence -> tighter (higher) lower bound"
+        );
+
+        // The optimizer's-curse case is caught: 0.70 on n=8 falls below the promote floor, while
+        // a genuine 0.55 on a large cohort clears it.
+        assert!(
+            lb_small < MIN_PROMOTE_PRECISION_LB,
+            "small-n 0.70 fluke is rejected"
+        );
+        assert!(
+            wilson_lower_bound(0.55, 400, WILSON_Z_95) >= MIN_PROMOTE_PRECISION_LB,
+            "large-n 0.55 edge clears the floor"
+        );
+
+        // Bounded in [0, 1] even at extremes.
+        assert!((0.0..=1.0).contains(&wilson_lower_bound(1.0, 5, WILSON_Z_95)));
+        assert!((0.0..=1.0).contains(&wilson_lower_bound(0.0, 5, WILSON_Z_95)));
     }
 }
