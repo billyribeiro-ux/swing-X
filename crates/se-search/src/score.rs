@@ -64,6 +64,13 @@ pub struct OosScore {
     /// Count of OOS trades acted on at τ\* (the acted cohort). Gates promotability via
     /// [`MIN_ACTED_TO_PROMOTE`]; distinct from `n_entries` (total labeled).
     pub n_acted_oos: i64,
+    /// Precision on a strict time-ordered forward holdout (train earliest 70%, measure latest 30%).
+    /// The durability metric — separates a real forward edge from bull-window regime-fitting.
+    pub precision_forward: f64,
+    /// Cost-aware expectancy (R) on the forward holdout.
+    pub expectancy_forward: f64,
+    /// Acted-trade count in the forward holdout (small ⇒ low-confidence durability estimate).
+    pub n_forward: i64,
 }
 
 impl OosScore {
@@ -92,6 +99,9 @@ impl OosScore {
             recall_oos: validation.recall_oos,
             act_threshold: validation.act_threshold,
             n_acted_oos: validation.n_acted_oos,
+            precision_forward: validation.precision_forward,
+            expectancy_forward: validation.expectancy_forward,
+            n_forward: validation.n_forward,
         }
     }
 
@@ -284,6 +294,9 @@ mod tests {
             recall_oos: 0.0,
             act_threshold: 0.5,
             n_acted_oos: 0,
+            precision_forward: 0.0,
+            expectancy_forward: 0.0,
+            n_forward: 0,
         }
     }
 

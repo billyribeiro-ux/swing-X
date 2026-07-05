@@ -161,6 +161,17 @@ pub struct ValidationResult {
     /// that refuses to promote genomes that act on too few OOS trades.
     #[serde(default)]
     pub n_acted_oos: i64,
+    /// Precision on a STRICT time-ordered forward holdout: fit + threshold on the earliest 70% of
+    /// rows, measure precision on the latest 30% (never shuffled). Distinguishes a durable edge
+    /// from regime-fitting that shuffled CPCV folds can flatter. Reported, never a ranking key.
+    #[serde(default)]
+    pub precision_forward: f64,
+    /// Cost-aware expectancy (R) on the same forward holdout at the forward acting threshold.
+    #[serde(default)]
+    pub expectancy_forward: f64,
+    /// Count of acted trades in the forward holdout (small = a weak, low-confidence estimate).
+    #[serde(default)]
+    pub n_forward: i64,
 }
 
 // --------------------------------------------------------------------------- //
