@@ -29,7 +29,9 @@ POST /validate
         "horizon": "swing",
         "fold_spec": {"n_groups": 8, "k_test_groups": 2,
                       "embargo_bars": 5, "purge": true},
-        "n_trials": 50}
+        "n_trials": 50,
+        "n_search_trials": 1200,
+        "forward_boundary_ts": "2024-01-01T00:00:00Z"}
     -> ValidateResult:
        {"dsr": 0.61, "pbo": 0.08, "oos_expectancy_cost_aware": 0.04,
         "profit_factor": 1.35, "cvar5": -0.7, "mar": 1.2,
@@ -119,6 +121,22 @@ class ValidateRequest(_Strict):
     horizon: str
     fold_spec: FoldSpec = FoldSpec()
     n_trials: int = Field(1, ge=1, description="Number of strategy trials (for DSR deflation).")
+    n_search_trials: int = Field(
+        1,
+        ge=1,
+        description=(
+            "Cumulative distinct genomes the search has evaluated; DSR deflates against "
+            "max(n_trials, n_search_trials)."
+        ),
+    )
+    forward_boundary_ts: str | None = Field(
+        None,
+        description=(
+            "RFC3339 timestamp; when set, the forward holdout splits train/holdout at this "
+            "boundary instead of the 70% row split (train ts < boundary, holdout ts >= "
+            "boundary)."
+        ),
+    )
 
 
 class ValidateResult(_Strict):

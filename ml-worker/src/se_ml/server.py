@@ -56,6 +56,18 @@ app = FastAPI(title="se_ml", version=__version__)
 # Round-trip trading cost charged per trade (in R) for cost-aware OOS expectancy.
 DEFAULT_COST_PER_TRADE_R = 0.05
 
+# Acted-sufficiency floor for the "positive in >= 2 regimes" gate condition: a regime bucket
+# counts toward ``n_regimes_positive`` only when it holds at least this many ACTED OOS rows.
+# The mean of one (or three) winning trades is not evidence of a regime-robust edge — a
+# single lucky trade must not tick the regime box. Buckets below the floor stay in the
+# returned ``regime_contrib`` map for transparency; they just do not count.
+MIN_REGIME_BUCKET_N = 20
+
+# Minimum rows each side of the calendar-median IS/OOS boundary must retain. Below this the
+# calendar split is degenerate (tiny dataset, or a ts column where the median value swallows
+# one side), so we fall back to the legacy row-count mid split.
+MIN_CALENDAR_SIDE_N = 20
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -107,18 +119,30 @@ def fit(req: FitRequest) -> FitResult:
 
 
 def _regime_contrib(df: pd.DataFrame, oos_returns: np.ndarray) -> tuple[dict[str, float], int]:
-    """Per-regime mean OOS return and count of regimes with positive contribution."""
+    """Per-regime mean OOS return and count of SUFFICIENTLY-SAMPLED positive regimes.
+
+    Every regime bucket is kept in the returned contrib map (transparency), but a regime
+    counts toward ``n_regimes_positive`` ONLY when its acted bucket holds at least
+    ``MIN_REGIME_BUCKET_N`` rows AND has a positive mean. A regime whose "positive
+    contribution" is the mean of one winning trade is not evidence; the floor keeps a
+    lucky sliver from ticking the gate's >=2-regimes box.
+    """
     if REGIME_COL not in df.columns:
-        # No regime tags: treat the whole sample as one regime.
-        contrib = {"all": float(np.mean(oos_returns)) if oos_returns.size else 0.0}
-        return contrib, int(sum(v > 0 for v in contrib.values()))
+        # No regime tags: treat the whole sample as one regime (same sufficiency floor).
+        n = int(oos_returns.size)
+        contrib = {"all": float(np.mean(oos_returns)) if n else 0.0}
+        return contrib, int(n >= MIN_REGIME_BUCKET_N and contrib["all"] > 0.0)
     regimes = df[REGIME_COL].to_numpy()
-    contrib = {}
+    contrib: dict[str, float] = {}
+    n_pos = 0
     for r in pd.unique(regimes):
         mask = regimes == r
         vals = oos_returns[mask]
-        contrib[str(r)] = float(np.mean(vals)) if vals.size else 0.0
-    return contrib, int(sum(v > 0 for v in contrib.values()))
+        mean = float(np.mean(vals)) if vals.size else 0.0
+        contrib[str(r)] = mean
+        if int(vals.size) >= MIN_REGIME_BUCKET_N and mean > 0.0:
+            n_pos += 1
+    return contrib, n_pos
 
 
 def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str, object]]:
@@ -457,6 +481,64 @@ def precision_recall_at(
     return float(precision), float(recall), n_acted
 
 
+def _calendar_split_masks(ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Full-length IS/OOS boolean masks split at the CALENDAR median of ``ts``.
+
+    ``mid = t // 2`` is a ROW-COUNT split; over a ticker-interleaved panel the row midpoint
+    maps to a genome-varying calendar date (whichever ticker mix happens to fill the rows),
+    so two genomes' "OOS halves" cover different eras. Instead we share ONE calendar
+    boundary: the 50% quantile of the ts values (lower interpolation — an actual ts value,
+    deterministic given the data). IS = ``ts < boundary``, OOS = ``ts >= boundary``, so
+    ``max(ts[is]) < min(ts[oos])`` — the split is genuinely chronological for every genome.
+
+    On a single-ticker dataset with unique sorted ts this reproduces the legacy row-count
+    mid split exactly (the 50%-quantile value sits at row ``t // 2``).
+
+    GUARD: if either side would hold fewer than ``MIN_CALENDAR_SIDE_N`` rows (tiny dataset,
+    or a degenerate ts column where the median value swallows one side — e.g. many rows
+    sharing one timestamp), fall back to the legacy row-count mid split so downstream
+    selection/threshold logic never operates on a near-empty side.
+    """
+    ts_arr = np.asarray(ts)
+    t = int(ts_arr.size)
+    # 50% quantile with lower interpolation: element at index t//2 of the sorted values.
+    if t > 0:
+        boundary = np.sort(ts_arr, kind="stable")[t // 2]
+        is_rows = ts_arr < boundary
+        oos_rows = ~is_rows
+        if int(is_rows.sum()) >= MIN_CALENDAR_SIDE_N and int(oos_rows.sum()) >= MIN_CALENDAR_SIDE_N:
+            return is_rows, oos_rows
+    # Legacy row-count fallback (also the t == 0 path): first half IS, second half OOS.
+    idx = np.arange(t)
+    mid = t // 2
+    return idx < mid, idx >= mid
+
+
+def _parse_forward_boundary(raw: str, ts: pd.Series) -> object:
+    """Parse an RFC3339 ``forward_boundary_ts`` into a value comparable with ``ts``.
+
+    Robust to tz-awareness mismatches in either direction:
+
+      * tz-aware dataset + naive boundary -> boundary localized to the dataset's tz;
+      * tz-aware dataset + aware boundary -> boundary converted to the dataset's tz;
+      * naive dataset + aware boundary    -> boundary converted to UTC, then made naive
+        (the on-disk convention: naive ts columns are UTC wall-clock).
+
+    For naive datetime64 datasets the result is a ``np.datetime64`` (directly comparable
+    with the ts ndarray); tz-aware datasets keep a ``pd.Timestamp``. Raises ``ValueError``
+    on an unparseable timestamp (the route maps that to HTTP 400).
+    """
+    b = pd.Timestamp(raw)
+    tz = getattr(ts.dtype, "tz", None)
+    if tz is not None:
+        return b.tz_localize(tz) if b.tz is None else b.tz_convert(tz)
+    if b.tz is not None:
+        b = b.tz_convert("UTC").tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(ts):
+        return b.to_datetime64()
+    return b
+
+
 def forward_holdout_precision(
     X: pd.DataFrame,
     y: np.ndarray,
@@ -465,6 +547,7 @@ def forward_holdout_precision(
     cost: float,
     seed: int,
     t1: np.ndarray | None = None,
+    boundary: object | None = None,
 ) -> tuple[float, float, int]:
     """Strict TIME-ORDERED forward-holdout precision/expectancy for the selected config.
 
@@ -487,6 +570,11 @@ def forward_holdout_precision(
            * ``expectancy`` = mean cost-aware R over acted holdout rows,
            * ``n`` = acted holdout count.
 
+    When ``boundary`` is given (a ts-comparable timestamp, e.g. the locked test era's start),
+    the split happens at that explicit calendar boundary instead of the 70% row split:
+    TRAIN = rows with ``ts < boundary``, HOLDOUT = rows with ``ts >= boundary``. The same
+    degeneracy guard applies (an empty side reports zeros).
+
     Degenerate cases (empty split, empty acted set) return ``(0.0, 0.0, 0)`` — never crash.
     """
     n = int(len(X))
@@ -501,7 +589,11 @@ def forward_holdout_precision(
     ts_ord = np.asarray(ts)[order]
     t1_ord = np.asarray(t1)[order] if t1 is not None else None
 
-    cut = int(np.floor(0.70 * n))
+    if boundary is not None:
+        # Explicit calendar boundary: TRAIN strictly before it, HOLDOUT at/after it.
+        cut = int(np.searchsorted(ts_ord, boundary, side="left"))
+    else:
+        cut = int(np.floor(0.70 * n))
     if cut <= 0 or cut >= n:
         # No usable train or no usable holdout: degenerate, report zeros.
         return 0.0, 0.0, 0
@@ -591,11 +683,11 @@ def validate(req: ValidateRequest) -> ValidateResult:
     )
 
     # In-sample selection: the config a naive search would pick (best IS mean return).
-    # We split the timeline in half and pick the best config on the first half, then report
-    # honestly on the second half — the standard "select IS, judge OOS" discipline.
-    t = trial_returns.shape[0]
-    mid = t // 2
-    is_perf = trial_returns[:mid].mean(axis=0)
+    # The IS/OOS boundary is a SHARED CALENDAR date (the median ts), not a row-count midpoint:
+    # over a ticker-interleaved panel the row midpoint maps to a genome-varying calendar date,
+    # so two genomes' "OOS halves" would cover different eras. Select IS, judge OOS as before.
+    is_rows, oos_rows = _calendar_split_masks(ts_all)
+    is_perf = trial_returns[is_rows].mean(axis=0)
     best = int(np.argmax(is_perf))
     selected = trial_returns[:, best]
 
@@ -610,10 +702,9 @@ def validate(req: ValidateRequest) -> ValidateResult:
     proba = _oos_proba_path_averaged(
         X, y_np, splits, grid[best], seed=1000 + best, ts=ts_all, t1=t1_all
     )
-    idx = np.arange(t)
     finite = ~np.isnan(proba)
-    is_mask = (idx < mid) & finite
-    oos_mask = (idx >= mid) & finite
+    is_mask = is_rows & finite
+    oos_mask = oos_rows & finite
 
     # Select tau* on the IS half only (no peeking at OOS), maximizing IS precision subject to
     # profitability + coverage + recall constraints (two-sub-fold confirmed for robustness);
@@ -636,15 +727,9 @@ def validate(req: ValidateRequest) -> ValidateResult:
     realized = y_np[row_mask]
     if realized.size == 0:
         # tau* acted on nothing OOS: fall back to the legacy 0.5-threshold traded series so
-        # the endpoint stays informative, then the whole OOS half if that is empty too.
-        selected_oos = selected[mid:]
-        traded = selected_oos[selected_oos != 0.0]
-        if traded.size > 0:
-            row_mask = np.zeros(t, dtype=bool)
-            row_mask[mid:] = selected_oos != 0.0
-        else:
-            row_mask = np.zeros(t, dtype=bool)
-            row_mask[mid:] = True
+        # the endpoint stays informative, then the whole OOS side if that is empty too.
+        traded_oos = oos_rows & (selected != 0.0)
+        row_mask = traded_oos if traded_oos.any() else oos_rows.copy()
         realized = y_np[row_mask]
     if realized.size == 0:
         raise HTTPException(status_code=422, detail="no OOS observations produced by CPCV")
@@ -654,9 +739,12 @@ def validate(req: ValidateRequest) -> ValidateResult:
     # Feed DSR the EFFECTIVE-N of the tau*-acted OOS series (Kish size over its average-
     # uniqueness weights) so the deflation uses the honest sample size, not the inflated one.
     acted_eff_n = effective_n(average_uniqueness(ts_all[row_mask], t1_all[row_mask]))
-    dsr = deflated_sharpe_ratio(
-        cost_aware, n_trials=max(1, req.n_trials), effective_n=acted_eff_n
-    )
+    # Deflate for the search's TRUE multiple-comparisons burden: the genetic search selects its
+    # winner over the run-cumulative count of DISTINCT genomes (n_search_trials), not just this
+    # call's internal config grid (n_trials). The gate threshold is unchanged — raising it is
+    # deferred until it can be calibrated against the locked test era.
+    total_trials = max(1, req.n_trials, req.n_search_trials)
+    dsr = deflated_sharpe_ratio(cost_aware, n_trials=total_trials, effective_n=acted_eff_n)
 
     # PBO via CSCV on the full trial matrix (needs >= 2 trials).
     if trial_returns.shape[1] >= 2:
@@ -682,8 +770,18 @@ def validate(req: ValidateRequest) -> ValidateResult:
     )
 
     # STRICT forward-held-out durability (reported, NOT gating): refit the SELECTED config on
-    # the earliest 70% of the (time-ordered) timeline and judge on the latest 30%. Never
+    # the earliest rows and judge on the latest. By default the split is 70/30; when the caller
+    # supplies `forward_boundary_ts` (e.g. the Rust test-era scorer fitting strictly PRE-era and
+    # measuring IN-era), the split happens at that explicit calendar boundary instead. Never
     # crashes; degenerate/empty holdout acted sets report zeros.
+    boundary: object | None = None
+    if req.forward_boundary_ts:
+        try:
+            boundary = _parse_forward_boundary(req.forward_boundary_ts, df[TS_COL])
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"bad forward_boundary_ts: {exc}"
+            ) from exc
     try:
         precision_forward, expectancy_forward, n_forward = forward_holdout_precision(
             X,
@@ -693,6 +791,7 @@ def validate(req: ValidateRequest) -> ValidateResult:
             DEFAULT_COST_PER_TRADE_R,
             seed=1000 + best,
             t1=t1_all,
+            boundary=boundary,
         )
     except (ValueError, KeyError):
         precision_forward, expectancy_forward, n_forward = 0.0, 0.0, 0
