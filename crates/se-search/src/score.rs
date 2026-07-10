@@ -262,6 +262,12 @@ pub struct ScoreConfig {
     pub n_groups: u32,
     pub k_test_groups: u32,
     pub n_trials: u32,
+    /// Cumulative count of DISTINCT genomes the search has evaluated so far in this run (set
+    /// per-call by the population manager from its dedup-signature map). The worker deflates DSR
+    /// against `max(n_trials, n_search_trials)`, so the deflation reflects the search's REAL
+    /// multiple-comparisons burden — the max over every genome tried, not just this validation's
+    /// internal config grid. `1` (the default) = no search multiplicity (legacy behavior).
+    pub n_search_trials: u32,
 }
 
 impl Default for ScoreConfig {
@@ -270,6 +276,7 @@ impl Default for ScoreConfig {
             n_groups: 6,
             k_test_groups: 2,
             n_trials: 12,
+            n_search_trials: 1,
         }
     }
 }
@@ -293,7 +300,21 @@ pub async fn score_oos(
 
     let name = format!("search_{strategy_id}.parquet");
     let outcome = harness
-        .evaluate(rows, profile, &name, n_groups, k_test, cfg.n_trials)
+        .evaluate_with(
+            rows,
+            profile,
+            &name,
+            &se_validation::EvaluateOptions {
+                n_groups,
+                k_test_groups: k_test,
+                n_trials: cfg.n_trials,
+                // The search's cumulative distinct-genome count: the worker deflates DSR
+                // against max(n_trials, n_search_trials) so significance reflects the real
+                // multiple-comparisons burden of the whole run.
+                n_search_trials: cfg.n_search_trials.max(1),
+                forward_boundary_ts: None,
+            },
+        )
         .await?;
 
     Ok(Some(OosScore::from_validation(

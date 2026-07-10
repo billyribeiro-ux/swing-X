@@ -254,9 +254,21 @@ impl<'a> PopulationManager<'a> {
         (all, n)
     }
 
+    /// Assemble the labeled dataset for one genome (rows + entry count) through the exact same
+    /// machinery the search uses (PIT feature windows -> backtest -> assemble -> test-era
+    /// firewall). Public so the once-only test-era scorer (`se test-era-score`) evaluates
+    /// promoted genomes with identical data semantics.
+    pub fn dataset_for(&self, genome: &Genome) -> (Vec<se_mlclient::DatasetRow>, usize) {
+        self.build_dataset(genome)
+    }
+
     /// Evaluate one genome end-to-end: backtest -> assemble -> OOS score. Tiny datasets return
     /// `Ok(Evaluated{score: None})` (logged, skipped) rather than erroring.
-    async fn evaluate_genome(&self, strategy: Strategy) -> Result<Evaluated> {
+    ///
+    /// `n_search_trials` is the run-cumulative count of DISTINCT genomes evaluated so far
+    /// (including this one); it flows into the worker's DSR deflation so significance reflects
+    /// the search's true multiple-comparisons burden.
+    async fn evaluate_genome(&self, strategy: Strategy, n_search_trials: u32) -> Result<Evaluated> {
         let (rows, n_entries) = self.build_dataset(&strategy.genome);
         if n_entries < MIN_ENTRIES_TO_VALIDATE {
             tracing::info!(
@@ -274,12 +286,16 @@ impl<'a> PopulationManager<'a> {
         // A per-genome validation error (e.g. the worker's 422 "no OOS observations produced by
         // CPCV" for a thin/degenerate cohort) must NOT abort the whole search — log and skip that
         // genome. A genuinely-down worker is caught up front by the CLI's health probe.
+        let score_cfg = ScoreConfig {
+            n_search_trials: n_search_trials.max(1),
+            ..self.cfg.score
+        };
         let score = match score_oos(
             self.harness,
             strategy.id,
             &rows,
             &self.cfg.profile,
-            self.cfg.score,
+            score_cfg,
         )
         .await
         {
@@ -372,7 +388,11 @@ impl<'a> PopulationManager<'a> {
                 let mut strategy = Strategy::new(genome);
                 strategy.id = id;
                 strategy.generation = gen;
-                let ev = self.evaluate_genome(strategy).await?;
+                // The signature map's size IS the run-cumulative distinct-genome count (this
+                // genome included) — the search's true multiple-comparisons burden, fed into
+                // the worker's DSR deflation.
+                let n_search_trials = id_for_signature.len() as u32;
+                let ev = self.evaluate_genome(strategy, n_search_trials).await?;
                 self.persist(&ev).await?;
                 evaluated.push(ev);
             }

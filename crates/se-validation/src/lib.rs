@@ -19,4 +19,4 @@ pub mod harness;
 pub use gate::{
     GateDecision, PromotionGate, DSR_MIN, MIN_POSITIVE_REGIMES, OOS_EXPECTANCY_MIN, PBO_MAX,
 };
-pub use harness::{HarnessOutcome, ValidationHarness};
+pub use harness::{EvaluateOptions, HarnessOutcome, ValidationHarness};
