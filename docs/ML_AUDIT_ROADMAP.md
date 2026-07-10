@@ -32,10 +32,10 @@ lower-bounded, regime-robust precision.
 
 | # | Item | Effort | Overfit risk | Status |
 |---|------|--------|--------------|--------|
-| 1 | **Locked out-of-time TEST era**, firewalled from all search+nightly, scored once, REPORT-ONLY (the selection-bias meter). Purge by label `t1`, not entry-ts. | M | zero (measures only) | ✅ firewall + forward-holdout metric shipped (`13fef15`, `f058cdd`); scoring the reserved era once is the follow-on |
+| 1 | **Locked out-of-time TEST era**, firewalled from all search+nightly, scored once, REPORT-ONLY (the selection-bias meter). Purge by label `t1`, not entry-ts. | M | zero (measures only) | ✅ DONE end-to-end: firewall (`f058cdd`) + `se test-era-score` (`befedd8`) + **first calibration recorded** (era 2025-07-01→2026-07-09; see below) |
 | 2 | **Wilson lower-bound precision gate** + per-regime acted-sufficiency floor (kill optimizer's-curse on n≈8 cohorts). | S–M | low | ✅ done (`97e570f`) — Wilson LB gate on promote + live floor |
 | 3 | **Precision NET of cost** (`threshold_r = cost`) wired into conviction + live floor. | S | zero | ✅ done (`607d9e3`) |
-| 4 | **Deflate DSR for the TRUE cumulative genome count** + set a real DSR threshold (currently `dsr>0`, always true). | M | low | pending — deliberately blocked on #1's test-era calibration run (raising the bar blindly is unfounded) |
+| 4 | **Deflate DSR for the TRUE cumulative genome count** + set a real DSR threshold (currently `dsr>0`, always true). | M | low | true-count deflation ✅ shipped (`e3e3979`, `befedd8`); threshold still `dsr>0` — the first calibration sample (2 clean strategies, n_test 7/15) is too small to set a bar from; accumulate more once-only measurements first |
 | 5 | **Aggregate combinatorial CPCV paths**; split on calendar dates, not row-count. | S | low | ✅ done (`84f3185`) — path-averaged proba (calendar split still open) |
 | 6 | **Point-in-time, survivorship-free universe** (delisted names, as-of membership, vintaged fundamentals) — the de-bias keystone. | XL | zero (de-bias) | blocked on data vendor (CRSP/Norgate/Sharadar) |
 | 7 | **Deep multi-regime history** (≥10–15y incl. 2008/2018/2022 bears), GATED on #6; macro-regime tag report-only. | M | low | blocked on #6 |
