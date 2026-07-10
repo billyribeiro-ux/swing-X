@@ -48,6 +48,28 @@ primary→secondary meta-model; calibration wiring; fractional-Kelly sizing; con
 Each was refuted as either below the noise floor, downstream of the real problem (selection), or
 adding fit surface without durable benefit.
 
+## First recorded calibration (era 2025-07-01 → 2026-07-09, data through 2026-07-09)
+
+Clean set = strategies promoted by FIREWALLED searches (training + selection never saw the era),
+each scored exactly once in-era (`test_era_scores`):
+
+| Strategy | Reported OOS (pre-era) | Locked era (never seen) | Gap |
+|---|---|---|---|
+| `96540337` | prec 0.624, +1.23R (n=133) | **prec 0.638, +1.27R (n=116)** | −0.014 |
+| `b4336198` | prec 0.588, +0.66R (n=233) | prec 0.429, +0.79R (n=7) | +0.159 |
+| `d524a599` | prec 0.525, +0.22R (n=221) | prec 0.533, +0.34R (n=15) | −0.008 |
+
+Reading: all three held POSITIVE cost-aware expectancy in a full unseen year; the lead strategy
+held precision ~0.64 over a substantive in-era cohort (n=116; Wilson LB ≈ 0.55). Mean clean gap
+≈ +0.05 — the discipline stack (Wilson-LB promote, net-of-cost precision, regime floor,
+true-count DSR, uniqueness weights, calendar split) is selecting strategies whose reported
+numbers approximately survive forward. Contrast: the pre-hardening engine's promotions collapsed
+to ~0.28 precision / negative expectancy on the same style of forward test.
+
+Caveats that stand: ONE era (itself broadly favorable), a survivor universe, 3 clean strategies.
+The DSR bar stays `dsr>0` until more eras/strategies accumulate; the decisive stress (a real
+bear era) is blocked on the survivorship-free multi-regime dataset (#6/#7).
+
 ## What "done based on hard evidence" means here
 
 Not a higher precision number. It means: (a) a locked test era that *measures* the selection gap;
