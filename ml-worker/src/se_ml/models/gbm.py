@@ -93,10 +93,16 @@ def fit_gbm(
     *,
     seed: int = DEFAULT_SEED,
     params: dict[str, Any] | None = None,
+    sample_weight: npt.ArrayLike | None = None,
 ) -> GbmModel:
     """Fit a deterministic LightGBM classifier on (X, binarised y).
 
     ``y`` is the R-unit label; the classifier target is ``(y > 0)``.
+
+    ``sample_weight`` (optional) is a per-row weight vector passed straight through to
+    LightGBM's ``fit`` — used to carry Lopez de Prado average-uniqueness weights so
+    overlapping (concurrent) labels do not over-count. ``None`` keeps the unweighted (iid)
+    fit unchanged. Determinism (seed threading, single-threaded histograms) is unaffected.
     """
     feature_names = list(X.columns)
     merged = {**_DEFAULT_PARAMS, **(params or {})}
@@ -109,8 +115,9 @@ def fit_gbm(
     y_arr = np.asarray(y, dtype=np.float64).ravel()
     y_bin = (y_arr > 0).astype(int)
 
+    sw = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).ravel()
     clf = LGBMClassifier(**merged)
-    clf.fit(X[feature_names], y_bin)
+    clf.fit(X[feature_names], y_bin, sample_weight=sw)
 
     model_id = _compute_model_id(feature_names, merged, seed)
     return GbmModel(

@@ -45,6 +45,7 @@ from .io_arrow import (
     split_features_labels,
 )
 from .labeling.meta_labeling import make_meta_labels
+from .labeling.uniqueness import average_uniqueness, effective_n
 from .models.gbm import GbmModel, fit_gbm
 from .stats import metrics as mx
 from .stats.dsr import deflated_sharpe_ratio
@@ -54,6 +55,18 @@ app = FastAPI(title="se_ml", version=__version__)
 
 # Round-trip trading cost charged per trade (in R) for cost-aware OOS expectancy.
 DEFAULT_COST_PER_TRADE_R = 0.05
+
+# Acted-sufficiency floor for the "positive in >= 2 regimes" gate condition: a regime bucket
+# counts toward ``n_regimes_positive`` only when it holds at least this many ACTED OOS rows.
+# The mean of one (or three) winning trades is not evidence of a regime-robust edge — a
+# single lucky trade must not tick the regime box. Buckets below the floor stay in the
+# returned ``regime_contrib`` map for transparency; they just do not count.
+MIN_REGIME_BUCKET_N = 20
+
+# Minimum rows each side of the calendar-median IS/OOS boundary must retain. Below this the
+# calendar split is degenerate (tiny dataset, or a ts column where the median value swallows
+# one side), so we fall back to the legacy row-count mid split.
+MIN_CALENDAR_SIDE_N = 20
 
 
 # --------------------------------------------------------------------------- #
@@ -106,18 +119,30 @@ def fit(req: FitRequest) -> FitResult:
 
 
 def _regime_contrib(df: pd.DataFrame, oos_returns: np.ndarray) -> tuple[dict[str, float], int]:
-    """Per-regime mean OOS return and count of regimes with positive contribution."""
+    """Per-regime mean OOS return and count of SUFFICIENTLY-SAMPLED positive regimes.
+
+    Every regime bucket is kept in the returned contrib map (transparency), but a regime
+    counts toward ``n_regimes_positive`` ONLY when its acted bucket holds at least
+    ``MIN_REGIME_BUCKET_N`` rows AND has a positive mean. A regime whose "positive
+    contribution" is the mean of one winning trade is not evidence; the floor keeps a
+    lucky sliver from ticking the gate's >=2-regimes box.
+    """
     if REGIME_COL not in df.columns:
-        # No regime tags: treat the whole sample as one regime.
-        contrib = {"all": float(np.mean(oos_returns)) if oos_returns.size else 0.0}
-        return contrib, int(sum(v > 0 for v in contrib.values()))
+        # No regime tags: treat the whole sample as one regime (same sufficiency floor).
+        n = int(oos_returns.size)
+        contrib = {"all": float(np.mean(oos_returns)) if n else 0.0}
+        return contrib, int(n >= MIN_REGIME_BUCKET_N and contrib["all"] > 0.0)
     regimes = df[REGIME_COL].to_numpy()
-    contrib = {}
+    contrib: dict[str, float] = {}
+    n_pos = 0
     for r in pd.unique(regimes):
         mask = regimes == r
         vals = oos_returns[mask]
-        contrib[str(r)] = float(np.mean(vals)) if vals.size else 0.0
-    return contrib, int(sum(v > 0 for v in contrib.values()))
+        mean = float(np.mean(vals)) if vals.size else 0.0
+        contrib[str(r)] = mean
+        if int(vals.size) >= MIN_REGIME_BUCKET_N and mean > 0.0:
+            n_pos += 1
+    return contrib, n_pos
 
 
 def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str, object]]:
@@ -149,12 +174,35 @@ def _trial_grid(n_trials: int, features: list[str], seed: int) -> list[dict[str,
     return grid
 
 
+def _uniqueness_weights(
+    ts: np.ndarray | None,
+    t1: np.ndarray | None,
+    train_idx: np.ndarray,
+) -> np.ndarray | None:
+    """Average-uniqueness sample weights for the TRAIN rows ``train_idx``, or ``None``.
+
+    Overlapping triple-barrier labels are not iid, so a raw fit over-weights concurrent
+    (redundant) rows. Weighting each training row by its Lopez de Prado average uniqueness
+    restores honesty about the effective sample size. Returns ``None`` when ``ts``/``t1`` are
+    unavailable (so the fit stays unweighted) and never raises — a weighting failure must
+    never crash a validation run.
+    """
+    if ts is None or t1 is None:
+        return None
+    try:
+        return average_uniqueness(np.asarray(ts)[train_idx], np.asarray(t1)[train_idx])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
 def _oos_proba_for_trial(
     X: pd.DataFrame,
     y_np: np.ndarray,
     splits: list,
     params: dict[str, object],
     seed: int,
+    ts: np.ndarray | None = None,
+    t1: np.ndarray | None = None,
 ) -> np.ndarray:
     """Full-timeline OOS per-observation probabilities for one trial, via CPCV.
 
@@ -162,6 +210,12 @@ def _oos_proba_for_trial(
     rows that never appear in any test fold are ``np.nan``. The trial's feature subset
     (``params['_features']``) restricts the model's inputs. This is the raw probability layer
     on top of which an acting threshold tau is applied.
+
+    SINGLE-PATH: with combinatorial CPCV a row can land in several test folds; this keeps only
+    the LAST-written fold's probability (order-dependent). When ``ts``/``t1`` are supplied each
+    per-fold fit is weighted by the training rows' average uniqueness (overlapping-label
+    honesty); passing ``None`` (the default) leaves the fit unweighted and byte-identical to
+    the legacy behavior.
     """
     model_params = {k: v for k, v in params.items() if not k.startswith("_")}
     features = params.get("_features")
@@ -170,10 +224,58 @@ def _oos_proba_for_trial(
     for sp in splits:
         if sp.train_idx.size == 0 or sp.test_idx.size == 0:
             continue
+        sw = _uniqueness_weights(ts, t1, sp.train_idx)
         model = fit_gbm(
-            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params,
+            sample_weight=sw,
         )
         out[sp.test_idx] = model.predict_proba(Xf.iloc[sp.test_idx])
+    return out
+
+
+def _oos_proba_path_averaged(
+    X: pd.DataFrame,
+    y_np: np.ndarray,
+    splits: list,
+    params: dict[str, object],
+    seed: int,
+    ts: np.ndarray | None = None,
+    t1: np.ndarray | None = None,
+) -> np.ndarray:
+    """PATH-AVERAGED OOS per-observation probabilities for one trial, via CPCV.
+
+    Combinatorial CPCV (``n_groups`` choose ``k``) holds each row out in MULTIPLE test folds.
+    :func:`_oos_proba_for_trial` keeps only the last fold's probability per row, collapsing the
+    combinatorial design to a single (order-dependent) path and discarding its variance
+    reduction. This function instead AVERAGES each row's probability over ALL folds that hold
+    it out — accumulating a per-row sum + count across splits, then dividing. Rows never tested
+    stay ``np.nan``. The result is order-invariant (stable across ``splits`` orderings) and
+    lower-variance, which is why the selected config's tau*/precision/expectancy reporting uses
+    it (while the PBO matrix + IS selection keep the single-path returns — see
+    :func:`_oos_returns_for_trial`).
+
+    When ``ts``/``t1`` are supplied each per-fold fit is uniqueness-weighted, exactly as in the
+    single-path variant.
+    """
+    model_params = {k: v for k, v in params.items() if not k.startswith("_")}
+    features = params.get("_features")
+    Xf = X[features] if isinstance(features, list) else X
+    n = len(X)
+    psum = np.zeros(n, dtype=np.float64)
+    pcount = np.zeros(n, dtype=np.float64)
+    for sp in splits:
+        if sp.train_idx.size == 0 or sp.test_idx.size == 0:
+            continue
+        sw = _uniqueness_weights(ts, t1, sp.train_idx)
+        model = fit_gbm(
+            Xf.iloc[sp.train_idx], y_np[sp.train_idx], seed=seed, params=model_params,
+            sample_weight=sw,
+        )
+        psum[sp.test_idx] += model.predict_proba(Xf.iloc[sp.test_idx])
+        pcount[sp.test_idx] += 1.0
+    out = np.full(n, np.nan, dtype=np.float64)
+    tested = pcount > 0
+    out[tested] = psum[tested] / pcount[tested]
     return out
 
 
@@ -219,11 +321,15 @@ def _threshold_stats(
     """Acting stats for ``tau`` on one (proba, r) fold.
 
     Returns ``(n_acted, precision, recall, expectancy)`` where precision is the fraction of
-    acted rows that are profitable (``make_meta_labels`` R > 0), recall is
-    #acted-and-profitable / #profitable, and expectancy is the cost-aware mean R over acted
-    rows (``-inf`` when nothing acted, so it never beats a real candidate on tie-breaks).
+    acted rows that are NET-profitable (``make_meta_labels`` R > ``cost``), recall is
+    #acted-and-net-profitable / #net-profitable, and expectancy is the cost-aware mean R over
+    acted rows (``-inf`` when nothing acted, so it never beats a real candidate on tie-breaks).
+
+    Profitability is measured NET of the round-trip cost so that "precision" is P(net profit |
+    acted), not the cost-blind P(R>0) — a 0<R<cost trade is a net loss and must NOT count as a
+    precision win (else the shipped conviction + live floor pass net-negative setups).
     """
-    labels = make_meta_labels(r)
+    labels = make_meta_labels(r, cost)
     n_profit = int(labels.sum())
     acted = proba >= tau
     n_acted = int(acted.sum())
@@ -349,20 +455,23 @@ def precision_recall_at(
     proba: np.ndarray,
     r: np.ndarray,
     tau: float,
+    cost: float,
 ) -> tuple[float, float, int]:
     """Precision, recall and acted-count for acting at threshold ``tau``.
 
     ``proba`` and ``r`` are same-length finite-proba arrays (probability and realized R).
     Acted = ``proba >= tau``. Returns ``(precision, recall, n_acted)`` where:
 
-      * precision = fraction of ACTED trades that were profitable (R > 0); 0.0 if none acted.
-      * recall    = #acted-and-profitable / #profitable opportunities; 0.0 if no profit rows.
+      * precision = fraction of ACTED trades that were NET-profitable (R > ``cost``); 0.0 if
+        none acted.
+      * recall    = #acted-and-net-profitable / #net-profitable opportunities; 0.0 if none.
       * n_acted   = number of acted rows.
 
-    Profitability labels come from :func:`make_meta_labels` (R > 0), keeping the live path's
-    notion of "win" consistent with the staged meta-labeling module.
+    Profitability is NET of the round-trip ``cost`` (``make_meta_labels(r, cost)``): a trade
+    with 0<R<cost is a net loss, so the north-star P(profit | acted) is P(NET profit | acted),
+    not the cost-blind win rate. This is the number that becomes the live conviction + floor.
     """
-    labels = make_meta_labels(r)
+    labels = make_meta_labels(r, cost)
     acted = proba >= tau
     n_acted = int(acted.sum())
     n_profit = int(labels.sum())
@@ -372,6 +481,64 @@ def precision_recall_at(
     return float(precision), float(recall), n_acted
 
 
+def _calendar_split_masks(ts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Full-length IS/OOS boolean masks split at the CALENDAR median of ``ts``.
+
+    ``mid = t // 2`` is a ROW-COUNT split; over a ticker-interleaved panel the row midpoint
+    maps to a genome-varying calendar date (whichever ticker mix happens to fill the rows),
+    so two genomes' "OOS halves" cover different eras. Instead we share ONE calendar
+    boundary: the 50% quantile of the ts values (lower interpolation — an actual ts value,
+    deterministic given the data). IS = ``ts < boundary``, OOS = ``ts >= boundary``, so
+    ``max(ts[is]) < min(ts[oos])`` — the split is genuinely chronological for every genome.
+
+    On a single-ticker dataset with unique sorted ts this reproduces the legacy row-count
+    mid split exactly (the 50%-quantile value sits at row ``t // 2``).
+
+    GUARD: if either side would hold fewer than ``MIN_CALENDAR_SIDE_N`` rows (tiny dataset,
+    or a degenerate ts column where the median value swallows one side — e.g. many rows
+    sharing one timestamp), fall back to the legacy row-count mid split so downstream
+    selection/threshold logic never operates on a near-empty side.
+    """
+    ts_arr = np.asarray(ts)
+    t = int(ts_arr.size)
+    # 50% quantile with lower interpolation: element at index t//2 of the sorted values.
+    if t > 0:
+        boundary = np.sort(ts_arr, kind="stable")[t // 2]
+        is_rows = ts_arr < boundary
+        oos_rows = ~is_rows
+        if int(is_rows.sum()) >= MIN_CALENDAR_SIDE_N and int(oos_rows.sum()) >= MIN_CALENDAR_SIDE_N:
+            return is_rows, oos_rows
+    # Legacy row-count fallback (also the t == 0 path): first half IS, second half OOS.
+    idx = np.arange(t)
+    mid = t // 2
+    return idx < mid, idx >= mid
+
+
+def _parse_forward_boundary(raw: str, ts: pd.Series) -> object:
+    """Parse an RFC3339 ``forward_boundary_ts`` into a value comparable with ``ts``.
+
+    Robust to tz-awareness mismatches in either direction:
+
+      * tz-aware dataset + naive boundary -> boundary localized to the dataset's tz;
+      * tz-aware dataset + aware boundary -> boundary converted to the dataset's tz;
+      * naive dataset + aware boundary    -> boundary converted to UTC, then made naive
+        (the on-disk convention: naive ts columns are UTC wall-clock).
+
+    For naive datetime64 datasets the result is a ``np.datetime64`` (directly comparable
+    with the ts ndarray); tz-aware datasets keep a ``pd.Timestamp``. Raises ``ValueError``
+    on an unparseable timestamp (the route maps that to HTTP 400).
+    """
+    b = pd.Timestamp(raw)
+    tz = getattr(ts.dtype, "tz", None)
+    if tz is not None:
+        return b.tz_localize(tz) if b.tz is None else b.tz_convert(tz)
+    if b.tz is not None:
+        b = b.tz_convert("UTC").tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(ts):
+        return b.to_datetime64()
+    return b
+
+
 def forward_holdout_precision(
     X: pd.DataFrame,
     y: np.ndarray,
@@ -379,6 +546,8 @@ def forward_holdout_precision(
     params: dict[str, object],
     cost: float,
     seed: int,
+    t1: np.ndarray | None = None,
+    boundary: object | None = None,
 ) -> tuple[float, float, int]:
     """Strict TIME-ORDERED forward-holdout precision/expectancy for the selected config.
 
@@ -401,6 +570,11 @@ def forward_holdout_precision(
            * ``expectancy`` = mean cost-aware R over acted holdout rows,
            * ``n`` = acted holdout count.
 
+    When ``boundary`` is given (a ts-comparable timestamp, e.g. the locked test era's start),
+    the split happens at that explicit calendar boundary instead of the 70% row split:
+    TRAIN = rows with ``ts < boundary``, HOLDOUT = rows with ``ts >= boundary``. The same
+    degeneracy guard applies (an empty side reports zeros).
+
     Degenerate cases (empty split, empty acted set) return ``(0.0, 0.0, 0)`` — never crash.
     """
     n = int(len(X))
@@ -412,8 +586,14 @@ def forward_holdout_precision(
     order = np.argsort(ts, kind="stable")
     X_ord = X.iloc[order].reset_index(drop=True)
     y_ord = np.asarray(y, dtype=np.float64)[order]
+    ts_ord = np.asarray(ts)[order]
+    t1_ord = np.asarray(t1)[order] if t1 is not None else None
 
-    cut = int(np.floor(0.70 * n))
+    if boundary is not None:
+        # Explicit calendar boundary: TRAIN strictly before it, HOLDOUT at/after it.
+        cut = int(np.searchsorted(ts_ord, boundary, side="left"))
+    else:
+        cut = int(np.floor(0.70 * n))
     if cut <= 0 or cut >= n:
         # No usable train or no usable holdout: degenerate, report zeros.
         return 0.0, 0.0, 0
@@ -425,14 +605,16 @@ def forward_holdout_precision(
     X_train, X_hold = Xf.iloc[:cut], Xf.iloc[cut:]
     y_train, y_hold = y_ord[:cut], y_ord[cut:]
 
-    # Fit the primary model on TRAIN only, predict on HOLDOUT.
-    model = fit_gbm(X_train, y_train, seed=seed, params=model_params)
+    # Fit the primary model on TRAIN only (uniqueness-weighted when t1 is available so the
+    # forward fit is honest about overlapping labels), predict on HOLDOUT.
+    train_w = _uniqueness_weights(ts_ord, t1_ord, np.arange(cut))
+    model = fit_gbm(X_train, y_train, seed=seed, params=model_params, sample_weight=train_w)
     proba_train = model.predict_proba(X_train)
     proba_hold = model.predict_proba(X_hold)
 
     # Select tau* on TRAIN (no HOLDOUT peeking), then measure on HOLDOUT.
     tau = select_act_threshold(proba_train, y_train, cost)
-    precision, _recall, n_acted = precision_recall_at(proba_hold, y_hold, tau)
+    precision, _recall, n_acted = precision_recall_at(proba_hold, y_hold, tau, cost)
     if n_acted == 0:
         return 0.0, 0.0, 0
 
@@ -480,9 +662,14 @@ def validate(req: ValidateRequest) -> ValidateResult:
     y_np = y.to_numpy()
     fs = req.fold_spec
 
+    # Event/barrier times drive both the CPCV purge AND the overlapping-label sample-uniqueness
+    # weights fed into every training fit + the effective-N behind DSR.
+    ts_all = df[TS_COL].to_numpy()
+    t1_all = df[T1_COL].to_numpy()
+
     splits = cpcv_splits(
-        event_ts=df[TS_COL].to_numpy(),
-        t1=df[T1_COL].to_numpy(),
+        event_ts=ts_all,
+        t1=t1_all,
         n_groups=fs.n_groups,
         k_test_groups=fs.k_test_groups,
         embargo_bars=fs.embargo_bars,
@@ -496,22 +683,28 @@ def validate(req: ValidateRequest) -> ValidateResult:
     )
 
     # In-sample selection: the config a naive search would pick (best IS mean return).
-    # We split the timeline in half and pick the best config on the first half, then report
-    # honestly on the second half — the standard "select IS, judge OOS" discipline.
-    t = trial_returns.shape[0]
-    mid = t // 2
-    is_perf = trial_returns[:mid].mean(axis=0)
+    # The IS/OOS boundary is a SHARED CALENDAR date (the median ts), not a row-count midpoint:
+    # over a ticker-interleaved panel the row midpoint maps to a genome-varying calendar date,
+    # so two genomes' "OOS halves" would cover different eras. Select IS, judge OOS as before.
+    is_rows, oos_rows = _calendar_split_masks(ts_all)
+    is_perf = trial_returns[is_rows].mean(axis=0)
     best = int(np.argmax(is_perf))
     selected = trial_returns[:, best]
 
     # Precision/threshold layer on the SELECTED config. Recover its raw per-row OOS
     # probabilities across the full timeline (np.nan where a row never appeared in a test
-    # fold) so we can choose an acting threshold tau* instead of the hardcoded 0.5.
-    proba = _oos_proba_for_trial(X, y_np, splits, grid[best], seed=1000 + best)
-    idx = np.arange(t)
+    # fold) so we can choose an acting threshold tau* instead of the hardcoded 0.5. We use the
+    # PATH-AVERAGED probability (mean over every CPCV fold that holds a row out) rather than the
+    # single last-write path: it recovers the combinatorial design's variance reduction and is
+    # order-invariant. Each per-fold fit is uniqueness-weighted (overlapping-label honesty).
+    # NOTE: the PBO matrix + IS selection above deliberately keep the single-path,
+    # unweighted returns (see _oos_returns_for_trial) — path-averaging must not touch them.
+    proba = _oos_proba_path_averaged(
+        X, y_np, splits, grid[best], seed=1000 + best, ts=ts_all, t1=t1_all
+    )
     finite = ~np.isnan(proba)
-    is_mask = (idx < mid) & finite
-    oos_mask = (idx >= mid) & finite
+    is_mask = is_rows & finite
+    oos_mask = oos_rows & finite
 
     # Select tau* on the IS half only (no peeking at OOS), maximizing IS precision subject to
     # profitability + coverage + recall constraints (two-sub-fold confirmed for robustness);
@@ -520,9 +713,10 @@ def validate(req: ValidateRequest) -> ValidateResult:
         proba[is_mask], y_np[is_mask], DEFAULT_COST_PER_TRADE_R
     )
 
-    # Measure precision/recall on the OOS half at tau*.
+    # Measure precision/recall on the OOS half at tau*. Precision is NET of cost (P(net profit
+    # | acted)) — a sub-cost winner (0<R<cost) is a net loss, not a precision win.
     precision_oos, recall_oos, n_acted_oos = precision_recall_at(
-        proba[oos_mask], y_np[oos_mask], act_threshold
+        proba[oos_mask], y_np[oos_mask], act_threshold, DEFAULT_COST_PER_TRADE_R
     )
 
     # The whole gate is precision-optimized: feed the tau*-acted OOS realized returns as the
@@ -533,21 +727,24 @@ def validate(req: ValidateRequest) -> ValidateResult:
     realized = y_np[row_mask]
     if realized.size == 0:
         # tau* acted on nothing OOS: fall back to the legacy 0.5-threshold traded series so
-        # the endpoint stays informative, then the whole OOS half if that is empty too.
-        selected_oos = selected[mid:]
-        traded = selected_oos[selected_oos != 0.0]
-        if traded.size > 0:
-            row_mask = np.zeros(t, dtype=bool)
-            row_mask[mid:] = selected_oos != 0.0
-        else:
-            row_mask = np.zeros(t, dtype=bool)
-            row_mask[mid:] = True
+        # the endpoint stays informative, then the whole OOS side if that is empty too.
+        traded_oos = oos_rows & (selected != 0.0)
+        row_mask = traded_oos if traded_oos.any() else oos_rows.copy()
         realized = y_np[row_mask]
     if realized.size == 0:
         raise HTTPException(status_code=422, detail="no OOS observations produced by CPCV")
 
     cost_aware = mx.cost_aware_returns(realized, DEFAULT_COST_PER_TRADE_R)
-    dsr = deflated_sharpe_ratio(cost_aware, n_trials=max(1, req.n_trials))
+    # Overlapping labels are not iid, so the nominal acted-row count overstates significance.
+    # Feed DSR the EFFECTIVE-N of the tau*-acted OOS series (Kish size over its average-
+    # uniqueness weights) so the deflation uses the honest sample size, not the inflated one.
+    acted_eff_n = effective_n(average_uniqueness(ts_all[row_mask], t1_all[row_mask]))
+    # Deflate for the search's TRUE multiple-comparisons burden: the genetic search selects its
+    # winner over the run-cumulative count of DISTINCT genomes (n_search_trials), not just this
+    # call's internal config grid (n_trials). The gate threshold is unchanged — raising it is
+    # deferred until it can be calibrated against the locked test era.
+    total_trials = max(1, req.n_trials, req.n_search_trials)
+    dsr = deflated_sharpe_ratio(cost_aware, n_trials=total_trials, effective_n=acted_eff_n)
 
     # PBO via CSCV on the full trial matrix (needs >= 2 trials).
     if trial_returns.shape[1] >= 2:
@@ -573,16 +770,28 @@ def validate(req: ValidateRequest) -> ValidateResult:
     )
 
     # STRICT forward-held-out durability (reported, NOT gating): refit the SELECTED config on
-    # the earliest 70% of the (time-ordered) timeline and judge on the latest 30%. Never
+    # the earliest rows and judge on the latest. By default the split is 70/30; when the caller
+    # supplies `forward_boundary_ts` (e.g. the Rust test-era scorer fitting strictly PRE-era and
+    # measuring IN-era), the split happens at that explicit calendar boundary instead. Never
     # crashes; degenerate/empty holdout acted sets report zeros.
+    boundary: object | None = None
+    if req.forward_boundary_ts:
+        try:
+            boundary = _parse_forward_boundary(req.forward_boundary_ts, df[TS_COL])
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"bad forward_boundary_ts: {exc}"
+            ) from exc
     try:
         precision_forward, expectancy_forward, n_forward = forward_holdout_precision(
             X,
             y_np,
-            df[TS_COL].to_numpy(),
+            ts_all,
             grid[best],
             DEFAULT_COST_PER_TRADE_R,
             seed=1000 + best,
+            t1=t1_all,
+            boundary=boundary,
         )
     except (ValueError, KeyError):
         precision_forward, expectancy_forward, n_forward = 0.0, 0.0, 0

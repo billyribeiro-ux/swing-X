@@ -226,7 +226,7 @@
 
 <p class="num text-[11px] text-base-500">
   Promotion gate requires DSR &gt; 0 and PBO &lt; 0.50 alongside positive cost-aware OOS expectancy
-  across multiple regimes. <span class="text-base-300">Precision</span> is the out-of-sample
-  P(profit | acted) at the meta-labeling acting threshold τ* (hover for τ* and the acted-cohort
-  size) — the headline accuracy, never win rate. Green = healthy, red = breaches the bound.
+  across multiple regimes. <span class="text-base-300">Precision</span> is the out-of-sample P(profit
+  | acted) at the meta-labeling acting threshold τ* (hover for τ* and the acted-cohort size) — the headline
+  accuracy, never win rate. Green = healthy, red = breaches the bound.
 </p>

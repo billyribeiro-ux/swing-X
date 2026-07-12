@@ -11,6 +11,7 @@ mod nightly;
 mod sanity;
 mod search_cmd;
 mod signals_cmd;
+mod test_era;
 mod trades;
 
 use std::collections::HashMap;
@@ -67,6 +68,9 @@ enum Cmd {
     Trades(TradesArgs),
     /// Run the full nightly walk-forward loop once (ingest→search→signals→journal→monitor→changelog).
     Nightly(nightly::NightlyArgs),
+    /// Score promoted strategies EXACTLY ONCE on the locked out-of-time test era
+    /// (SE_TEST_FROM/SE_TEST_TO) and print the optimism gap. Report-only; never gates.
+    TestEraScore(test_era::TestEraArgs),
 }
 
 #[derive(Args)]
@@ -246,6 +250,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Trades(args) => trades::run(&cfg, args.horizon, args.from, args.to).await?,
         Cmd::Nightly(args) => nightly::run(&cfg, args).await?,
+        Cmd::TestEraScore(args) => test_era::run(&cfg, args).await?,
     }
     Ok(())
 }

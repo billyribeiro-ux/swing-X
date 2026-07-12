@@ -29,6 +29,36 @@ pub const MIN_ENTRIES_TO_VALIDATE: usize = 40;
 /// promotions. See [`crate::population`].
 pub const MIN_ACTED_TO_PROMOTE: usize = 8;
 
+/// z for a one-sided ~95% Wilson lower bound on a binomial proportion.
+pub const WILSON_Z_95: f64 = 1.96;
+
+/// The minimum WILSON LOWER BOUND on OOS precision a genome must clear to be promoted. Gating on
+/// the point estimate is textbook optimizer's-curse: the search maximizes precision over many
+/// genomes on tiny acted cohorts, so a "best 0.73 on n=8" is statistically consistent with the
+/// ~0.5 mean (Wilson half-width ≈ ±0.25-0.30). Requiring the *lower bound* of the (net-of-cost)
+/// precision interval to clear this floor keeps only genomes whose edge survives sampling
+/// uncertainty — a large-n 0.55 passes, a small-n 0.73 fluke does not. Tune jointly with history
+/// depth (a strict floor on a shallow single-regime window can starve promotions).
+pub const MIN_PROMOTE_PRECISION_LB: f64 = 0.45;
+
+/// One-sided Wilson score-interval lower bound for a binomial proportion `p` observed over `n`
+/// trials, at confidence `z` (see [`WILSON_Z_95`]). Unlike the raw `p ± z·SE` Wald interval, the
+/// Wilson bound is well-behaved for small `n` and near 0/1 — exactly the tiny-cohort regime where
+/// the search's best-of-many precision is most optimistically biased. Returns `0.0` for `n <= 0`
+/// (no evidence) and clamps to `[0, 1]`.
+pub fn wilson_lower_bound(p: f64, n: i64, z: f64) -> f64 {
+    if n <= 0 || !p.is_finite() {
+        return 0.0;
+    }
+    let n = n as f64;
+    let p = p.clamp(0.0, 1.0);
+    let z2 = z * z;
+    let denom = 1.0 + z2 / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = z * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
+    ((centre - margin) / denom).clamp(0.0, 1.0)
+}
+
 /// An out-of-sample score for one strategy. The ONLY sortable summary the search keeps.
 ///
 /// Constructed only from OOS validation output + the gate. The fields below are all OOS or
@@ -64,6 +94,13 @@ pub struct OosScore {
     /// Count of OOS trades acted on at τ\* (the acted cohort). Gates promotability via
     /// [`MIN_ACTED_TO_PROMOTE`]; distinct from `n_entries` (total labeled).
     pub n_acted_oos: i64,
+    /// Precision on a strict time-ordered forward holdout (train earliest 70%, measure latest 30%).
+    /// The durability metric — separates a real forward edge from bull-window regime-fitting.
+    pub precision_forward: f64,
+    /// Cost-aware expectancy (R) on the forward holdout.
+    pub expectancy_forward: f64,
+    /// Acted-trade count in the forward holdout (small ⇒ low-confidence durability estimate).
+    pub n_forward: i64,
 }
 
 impl OosScore {
@@ -92,6 +129,9 @@ impl OosScore {
             recall_oos: validation.recall_oos,
             act_threshold: validation.act_threshold,
             n_acted_oos: validation.n_acted_oos,
+            precision_forward: validation.precision_forward,
+            expectancy_forward: validation.expectancy_forward,
+            n_forward: validation.n_forward,
         }
     }
 
@@ -222,6 +262,12 @@ pub struct ScoreConfig {
     pub n_groups: u32,
     pub k_test_groups: u32,
     pub n_trials: u32,
+    /// Cumulative count of DISTINCT genomes the search has evaluated so far in this run (set
+    /// per-call by the population manager from its dedup-signature map). The worker deflates DSR
+    /// against `max(n_trials, n_search_trials)`, so the deflation reflects the search's REAL
+    /// multiple-comparisons burden — the max over every genome tried, not just this validation's
+    /// internal config grid. `1` (the default) = no search multiplicity (legacy behavior).
+    pub n_search_trials: u32,
 }
 
 impl Default for ScoreConfig {
@@ -230,6 +276,7 @@ impl Default for ScoreConfig {
             n_groups: 6,
             k_test_groups: 2,
             n_trials: 12,
+            n_search_trials: 1,
         }
     }
 }
@@ -253,7 +300,21 @@ pub async fn score_oos(
 
     let name = format!("search_{strategy_id}.parquet");
     let outcome = harness
-        .evaluate(rows, profile, &name, n_groups, k_test, cfg.n_trials)
+        .evaluate_with(
+            rows,
+            profile,
+            &name,
+            &se_validation::EvaluateOptions {
+                n_groups,
+                k_test_groups: k_test,
+                n_trials: cfg.n_trials,
+                // The search's cumulative distinct-genome count: the worker deflates DSR
+                // against max(n_trials, n_search_trials) so significance reflects the real
+                // multiple-comparisons burden of the whole run.
+                n_search_trials: cfg.n_search_trials.max(1),
+                forward_boundary_ts: None,
+            },
+        )
         .await?;
 
     Ok(Some(OosScore::from_validation(
@@ -284,6 +345,9 @@ mod tests {
             recall_oos: 0.0,
             act_threshold: 0.5,
             n_acted_oos: 0,
+            precision_forward: 0.0,
+            expectancy_forward: 0.0,
+            n_forward: 0,
         }
     }
 
@@ -509,5 +573,36 @@ mod tests {
         // A location predicate -> actionable.
         let with_location = Genome::new(Side::Long, Horizon::Swing, vec![pred(Layer::Location)]);
         assert!(genome_has_actionable_predicate(&with_location));
+    }
+
+    #[test]
+    fn wilson_lower_bound_penalizes_small_n_and_tightens_with_n() {
+        // Degenerate / no-evidence inputs.
+        assert_eq!(wilson_lower_bound(0.7, 0, WILSON_Z_95), 0.0);
+        assert_eq!(wilson_lower_bound(f64::NAN, 100, WILSON_Z_95), 0.0);
+
+        // The lower bound is always <= the point estimate, and rises toward it as n grows.
+        let lb_small = wilson_lower_bound(0.7, 8, WILSON_Z_95);
+        let lb_big = wilson_lower_bound(0.7, 400, WILSON_Z_95);
+        assert!(lb_small < 0.7 && lb_big < 0.7);
+        assert!(
+            lb_big > lb_small,
+            "more evidence -> tighter (higher) lower bound"
+        );
+
+        // The optimizer's-curse case is caught: 0.70 on n=8 falls below the promote floor, while
+        // a genuine 0.55 on a large cohort clears it.
+        assert!(
+            lb_small < MIN_PROMOTE_PRECISION_LB,
+            "small-n 0.70 fluke is rejected"
+        );
+        assert!(
+            wilson_lower_bound(0.55, 400, WILSON_Z_95) >= MIN_PROMOTE_PRECISION_LB,
+            "large-n 0.55 edge clears the floor"
+        );
+
+        // Bounded in [0, 1] even at extremes.
+        assert!((0.0..=1.0).contains(&wilson_lower_bound(1.0, 5, WILSON_Z_95)));
+        assert!((0.0..=1.0).contains(&wilson_lower_bound(0.0, 5, WILSON_Z_95)));
     }
 }

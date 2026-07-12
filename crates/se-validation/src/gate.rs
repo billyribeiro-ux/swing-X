@@ -126,6 +126,9 @@ mod tests {
             recall_oos: 0.0,
             act_threshold: 0.5,
             n_acted_oos: 0,
+            precision_forward: 0.0,
+            expectancy_forward: 0.0,
+            n_forward: 0,
         }
     }
 

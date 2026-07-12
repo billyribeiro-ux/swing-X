@@ -60,8 +60,9 @@ pub async fn insert_oos_score(
         "INSERT INTO oos_scores \
             (strategy_id, fold_spec, dsr, pbo, oos_expectancy_cost_aware, profit_factor, \
              cvar5, mar, regime_contrib, n_regimes_positive, passed_gate, \
-             precision_oos, recall_oos, act_threshold, n_acted) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+             precision_oos, recall_oos, act_threshold, n_acted, \
+             precision_forward, expectancy_forward, n_forward) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
     )
     .bind(score.strategy_id.inner())
     .bind(fold_spec)
@@ -78,6 +79,9 @@ pub async fn insert_oos_score(
     .bind(score.recall_oos)
     .bind(score.act_threshold)
     .bind(score.n_acted_oos as i32)
+    .bind(score.precision_forward)
+    .bind(score.expectancy_forward)
+    .bind(score.n_forward as i32)
     .execute(store.pool())
     .await
     .map_err(store_err)?;
@@ -139,28 +143,16 @@ pub async fn load_promoted(
     Ok(out)
 }
 
-/// The latest OOS score for a strategy (for signal cohort stats), if any.
+/// The latest OOS score for a strategy (for signal cohort stats), if any. Columns are read by
+/// name (not a positional tuple) because the row now has more than the 16 fields sqlx's tuple
+/// `FromRow` supports.
 pub async fn latest_oos_score(store: &Store, id: StrategyId) -> Result<Option<StoredOosScore>> {
-    type Row = (
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        serde_json::Value,
-        i32,
-        bool,
-        serde_json::Value,
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-        Option<i32>,
-    );
-    let row: Option<Row> = se_store::sqlx::query_as(
+    use se_store::sqlx::Row as _;
+    let row = se_store::sqlx::query(
         "SELECT dsr, pbo, oos_expectancy_cost_aware, profit_factor, cvar5, mar, \
                 regime_contrib, n_regimes_positive, passed_gate, fold_spec, \
-                precision_oos, recall_oos, act_threshold, n_acted \
+                precision_oos, recall_oos, act_threshold, n_acted, \
+                precision_forward, expectancy_forward, n_forward \
          FROM oos_scores WHERE strategy_id = $1 ORDER BY evaluated_at DESC LIMIT 1",
     )
     .bind(id.inner())
@@ -169,27 +161,36 @@ pub async fn latest_oos_score(store: &Store, id: StrategyId) -> Result<Option<St
     .map_err(store_err)?;
 
     Ok(row.map(|r| {
-        let n_entries =
-            r.9.get("n_entries")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32)
-                .unwrap_or(0);
+        let fold_spec: serde_json::Value =
+            r.try_get("fold_spec").unwrap_or(serde_json::Value::Null);
+        let n_entries = fold_spec
+            .get("n_entries")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(0);
+        // `n_acted`/`n_forward` are stored as INT (i32); widen to i64 to mirror the wire type.
+        let n_acted: Option<i32> = r.try_get("n_acted").ok().flatten();
+        let n_forward: Option<i32> = r.try_get("n_forward").ok().flatten();
         StoredOosScore {
-            dsr: r.0,
-            pbo: r.1,
-            oos_expectancy_cost_aware: r.2,
-            profit_factor: r.3,
-            cvar5: r.4,
-            mar: r.5,
-            regime_contrib: r.6,
-            n_regimes_positive: r.7,
-            passed_gate: r.8,
+            dsr: r.try_get("dsr").ok().flatten(),
+            pbo: r.try_get("pbo").ok().flatten(),
+            oos_expectancy_cost_aware: r.try_get("oos_expectancy_cost_aware").ok().flatten(),
+            profit_factor: r.try_get("profit_factor").ok().flatten(),
+            cvar5: r.try_get("cvar5").ok().flatten(),
+            mar: r.try_get("mar").ok().flatten(),
+            regime_contrib: r
+                .try_get("regime_contrib")
+                .unwrap_or(serde_json::Value::Null),
+            n_regimes_positive: r.try_get("n_regimes_positive").unwrap_or(0),
+            passed_gate: r.try_get("passed_gate").unwrap_or(false),
             n_entries,
-            precision_oos: r.10,
-            recall_oos: r.11,
-            act_threshold: r.12,
-            // `n_acted` is stored as INT (i32); widen to i64 to mirror the wire/`OosScore` type.
-            n_acted: r.13.map(i64::from),
+            precision_oos: r.try_get("precision_oos").ok().flatten(),
+            recall_oos: r.try_get("recall_oos").ok().flatten(),
+            act_threshold: r.try_get("act_threshold").ok().flatten(),
+            n_acted: n_acted.map(i64::from),
+            precision_forward: r.try_get("precision_forward").ok().flatten(),
+            expectancy_forward: r.try_get("expectancy_forward").ok().flatten(),
+            n_forward: n_forward.map(i64::from),
         }
     }))
 }
@@ -216,6 +217,12 @@ pub struct StoredOosScore {
     pub act_threshold: Option<f64>,
     /// OOS trades acted on at τ\* (None for pre-migration rows).
     pub n_acted: Option<i64>,
+    /// Forward-holdout precision — the durability metric (None for pre-forward-migration rows).
+    pub precision_forward: Option<f64>,
+    /// Forward-holdout cost-aware expectancy in R (None for pre-forward-migration rows).
+    pub expectancy_forward: Option<f64>,
+    /// Forward-holdout acted-trade count (None for pre-forward-migration rows).
+    pub n_forward: Option<i64>,
 }
 
 fn parse_status(s: &str) -> StrategyStatus {

@@ -102,6 +102,13 @@ impl Default for FoldSpec {
     }
 }
 
+/// Default for [`MlValidateRequest::n_search_trials`] when a request (or an older caller /
+/// hand-built fixture) omits it: a single trial, i.e. no search-level multiplicity beyond
+/// `n_trials`. Mirrors the pydantic default on the Python side.
+fn default_n_search_trials() -> u32 {
+    1
+}
+
 /// `POST /validate` request body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MlValidateRequest {
@@ -111,6 +118,23 @@ pub struct MlValidateRequest {
     pub fold_spec: FoldSpec,
     /// Number of strategy trials for DSR deflation / PBO (>= 1).
     pub n_trials: u32,
+    /// The CUMULATIVE count of DISTINCT genomes the search has evaluated so far in this run
+    /// (monotonically growing across generations — the size of the search's canonical-signature
+    /// dedup map at validation time). The worker deflates DSR against
+    /// `max(n_trials, n_search_trials)`, making the deflation honest about the search's real
+    /// multiple-comparisons burden instead of only the per-validation grid. Defaults to 1
+    /// (no search multiplicity) so older callers/fixtures still deserialize and behave as before.
+    #[serde(default = "default_n_search_trials")]
+    pub n_search_trials: u32,
+    /// Optional RFC3339 timestamp splitting the worker's STRICT forward holdout at an explicit
+    /// time boundary: when set, the forward model + acting threshold are fit on rows with
+    /// `ts < forward_boundary_ts` and precision/expectancy are measured on `ts >=
+    /// forward_boundary_ts` (returned in the existing `precision_forward` /
+    /// `expectancy_forward` / `n_forward` response fields). When absent the worker keeps its
+    /// default 70/30 row split. Never serialized when `None` so older workers see an
+    /// unchanged request body.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub forward_boundary_ts: Option<String>,
 }
 
 /// `POST /calibrate` request body.
@@ -161,6 +185,17 @@ pub struct ValidationResult {
     /// that refuses to promote genomes that act on too few OOS trades.
     #[serde(default)]
     pub n_acted_oos: i64,
+    /// Precision on a STRICT time-ordered forward holdout: fit + threshold on the earliest 70% of
+    /// rows, measure precision on the latest 30% (never shuffled). Distinguishes a durable edge
+    /// from regime-fitting that shuffled CPCV folds can flatter. Reported, never a ranking key.
+    #[serde(default)]
+    pub precision_forward: f64,
+    /// Cost-aware expectancy (R) on the same forward holdout at the forward acting threshold.
+    #[serde(default)]
+    pub expectancy_forward: f64,
+    /// Count of acted trades in the forward holdout (small = a weak, low-confidence estimate).
+    #[serde(default)]
+    pub n_forward: i64,
 }
 
 // --------------------------------------------------------------------------- //

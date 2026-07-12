@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use chrono::NaiveDate;
 use se_core::{
     Error, Horizon, HorizonProfile, Result, RiskModel, Scanner, StopSpec, TargetSpec, Ticker,
 };
@@ -30,6 +31,12 @@ pub struct AppConfig {
     /// Whether the search locks risk to `risk` (ground rules fixed; conditions optimized) or
     /// explores it. From `SE_LOCK_RISK`.
     pub lock_risk: bool,
+    /// Start of the LOCKED out-of-time TEST ERA (`SE_TEST_FROM`, `YYYY-MM-DD`). See [`Self::test_era`].
+    /// Unset => `None` => no reservation (fully backward-compatible).
+    pub test_from: Option<NaiveDate>,
+    /// End of the LOCKED out-of-time TEST ERA (`SE_TEST_TO`, `YYYY-MM-DD`). See [`Self::test_era`].
+    /// Unset => `None` => no reservation (fully backward-compatible).
+    pub test_to: Option<NaiveDate>,
 }
 
 impl AppConfig {
@@ -72,6 +79,12 @@ impl AppConfig {
             .map_err(|e| Error::Config(e.to_string()))?
             .unwrap_or_default();
 
+        // The LOCKED out-of-time TEST ERA (report-only reservation). Either bound unset => None
+        // for that bound; the `test_era()` accessor only yields a reservation when BOTH are set
+        // and ordered. Parsing is independent per-bound so a single malformed date is a clear error.
+        let test_from = parse_reservation_date("SE_TEST_FROM")?;
+        let test_to = parse_reservation_date("SE_TEST_TO")?;
+
         let universe = match scanner {
             Scanner::Etf => Ticker::ALL.to_vec(),
             Scanner::Equity => resolve_equity_universe()?,
@@ -88,7 +101,35 @@ impl AppConfig {
             fred_configured,
             risk,
             lock_risk,
+            test_from,
+            test_to,
         })
+    }
+
+    /// The reserved LOCKED out-of-time TEST ERA `(from, to)` (inclusive dates), or `None`.
+    ///
+    /// Yields `Some` ONLY when BOTH `SE_TEST_FROM` and `SE_TEST_TO` are set AND `from <= to`;
+    /// any other combination (either bound unset, or an inverted range) yields `None` = no
+    /// reservation. This era is FIREWALLED out of every search/nightly training dataset so it can
+    /// later serve as an honest, never-touched selection-bias meter. It is REPORT-ONLY: it never
+    /// feeds rank_key/gate/survivor selection/nightly scoring or any promotion decision.
+    pub fn test_era(&self) -> Option<(NaiveDate, NaiveDate)> {
+        match (self.test_from, self.test_to) {
+            (Some(from), Some(to)) if from <= to => Some((from, to)),
+            _ => None,
+        }
+    }
+}
+
+/// Parse an optional `YYYY-MM-DD` reservation-boundary date from env `var`. Unset or empty =>
+/// `Ok(None)`; a present-but-malformed value is a hard [`Error::Config`] (a typo in a reservation
+/// boundary must fail loudly, never silently disable the firewall).
+fn parse_reservation_date(var: &str) -> Result<Option<NaiveDate>> {
+    match std::env::var(var) {
+        Ok(s) if !s.trim().is_empty() => NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            .map(Some)
+            .map_err(|e| Error::Config(format!("{var}: {e}"))),
+        _ => Ok(None),
     }
 }
 
@@ -237,5 +278,70 @@ mod tests {
         for f in ["0", "false", "no", "", "off"] {
             assert!(!parse_bool(f), "{f} should be false");
         }
+    }
+
+    /// A minimal config carrying only the reservation bounds under test (other fields are inert
+    /// placeholders — `test_era()` reads only `test_from`/`test_to`).
+    fn cfg_with(test_from: Option<NaiveDate>, test_to: Option<NaiveDate>) -> AppConfig {
+        let profile = HorizonProfile::for_horizon(Horizon::Swing);
+        let risk = RiskModel::from_profile(&profile);
+        AppConfig {
+            database_url: String::new(),
+            ml_worker_url: String::new(),
+            api_bind: String::new(),
+            horizon: profile,
+            scanner: Scanner::Etf,
+            universe: Vec::new(),
+            fmp_configured: false,
+            fred_configured: false,
+            risk,
+            lock_risk: false,
+            test_from,
+            test_to,
+        }
+    }
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn test_era_requires_both_bounds_and_order() {
+        let from = date(2024, 1, 1);
+        let to = date(2024, 6, 30);
+
+        // Both set and ordered -> a reservation.
+        assert_eq!(cfg_with(Some(from), Some(to)).test_era(), Some((from, to)));
+        // A single-day era (from == to) is valid.
+        assert_eq!(
+            cfg_with(Some(from), Some(from)).test_era(),
+            Some((from, from))
+        );
+        // Either bound unset -> no reservation (backward-compatible default).
+        assert_eq!(cfg_with(None, Some(to)).test_era(), None);
+        assert_eq!(cfg_with(Some(from), None).test_era(), None);
+        assert_eq!(cfg_with(None, None).test_era(), None);
+        // Inverted range (from > to) is ignored rather than firewalling a nonsense window.
+        assert_eq!(cfg_with(Some(to), Some(from)).test_era(), None);
+    }
+
+    #[test]
+    fn reservation_date_parsing() {
+        // Unset var -> None (use a var name that is certainly not present).
+        assert_eq!(
+            parse_reservation_date("SE_TEST_FROM__definitely_unset").unwrap(),
+            None
+        );
+        // A malformed present value is a hard error (never a silent None that disables the firewall).
+        // SAFETY: single-threaded test process.
+        unsafe { std::env::set_var("SE_TEST_RESV_BADDATE", "2024-13-99") };
+        assert!(parse_reservation_date("SE_TEST_RESV_BADDATE").is_err());
+        unsafe { std::env::set_var("SE_TEST_RESV_OK", "2024-02-29") };
+        assert_eq!(
+            parse_reservation_date("SE_TEST_RESV_OK").unwrap(),
+            Some(date(2024, 2, 29))
+        );
+        unsafe { std::env::remove_var("SE_TEST_RESV_BADDATE") };
+        unsafe { std::env::remove_var("SE_TEST_RESV_OK") };
     }
 }

@@ -82,6 +82,12 @@ pub async fn run(cfg: &AppConfig, args: NightlyArgs) -> Result<()> {
         to
     );
     println!(" loop: {}", NIGHTLY.map(|s| s.label()).join(" → "));
+    // The nightly search step delegates to `search_cmd::run_search`, which reads `cfg.test_era()`
+    // and hands the reserved window to the dataset FIREWALL — so any reserved out-of-time era is
+    // purged from nightly training too (report-only; never feeds ranking/gate/promotion).
+    if let Some((f, t)) = cfg.test_era() {
+        println!(" out-of-time TEST ERA: {f} → {t} FIREWALLED from nightly search (report-only)");
+    }
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     for step in NIGHTLY {

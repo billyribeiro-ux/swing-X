@@ -27,7 +27,7 @@ use se_features::{
 use se_provider::NullProprietary;
 use se_regime::RegimeClassifier;
 use se_search::persist::{latest_oos_score, load_promoted, StoredOosScore};
-use se_search::MIN_ACTED_TO_PROMOTE;
+use se_search::{wilson_lower_bound, MIN_ACTED_TO_PROMOTE, WILSON_Z_95};
 use se_store::Store;
 
 use crate::conviction::{from_cohort, from_oos_precision};
@@ -232,11 +232,14 @@ pub async fn build_signal_for(
     };
 
     // Live precision floor (defence-in-depth): when the validator measured this strategy's OOS
-    // precision (P(profit | acted) at τ*) over a non-trivial acted cohort, hold the live single-
-    // name bar above the search's promote bar. Legacy scores (NULL precision) skip this check.
+    // precision (P(net profit | acted) at τ*) over a non-trivial acted cohort, hold the live
+    // single-name bar above the search's promote bar. We gate on the WILSON LOWER BOUND of the
+    // precision, not the point estimate, so a small-n high-precision fluke cannot slip through on
+    // sampling luck. Legacy scores (NULL precision) skip this check.
     if let (Some(p), Some(n)) = (score.precision_oos, score.n_acted) {
-        if n as usize >= MIN_ACTED_TO_PROMOTE && p < MIN_LIVE_PRECISION {
-            return Ok(SignalAttempt::Skipped(NoSignal::LowPrecision(p)));
+        let lb = wilson_lower_bound(p, n, WILSON_Z_95);
+        if n as usize >= MIN_ACTED_TO_PROMOTE && lb < MIN_LIVE_PRECISION {
+            return Ok(SignalAttempt::Skipped(NoSignal::LowPrecision(lb)));
         }
     }
 

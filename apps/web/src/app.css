@@ -1,13 +1,30 @@
 @import 'tailwindcss';
 
 /*
+ * Self-hosted variable webfonts — the actual Inter / JetBrains Mono this theme targets.
+ * Bundled by Vite (no external requests at runtime), so typography renders identically on
+ * every machine instead of falling back to each OS's default sans/mono. Loaded here in the
+ * CSS layer (only the `latin` subset is fetched for English text, via unicode-range).
+ */
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
+
+/*
  * swing-X operator console theme.
  * Dark, dense, monospace numerics. Tailwind v4 token layer via @theme — these
  * generate utilities like `bg-base-900`, `text-up`, `border-base-800`, etc.
  */
 @theme {
-  --font-mono: 'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', ui-monospace, monospace;
-  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  /*
+   * The `… Variable` families are the real fonts the design targets (imported above); the
+   * plain names and system stack are graceful fallbacks for the brief pre-load window /
+   * offline builds so the typography stays visually stable everywhere.
+   */
+  --font-mono:
+    'JetBrains Mono Variable', 'JetBrains Mono', 'SF Mono', 'Menlo', 'Consolas', ui-monospace,
+    monospace;
+  --font-sans:
+    'Inter Variable', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
 
   /* Neutral surface ramp (cool slate) */
   --color-base-50: oklch(0.985 0.005 250);
@@ -44,6 +61,7 @@
   body {
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
   }
 

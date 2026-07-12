@@ -66,14 +66,15 @@ def expected_max_sharpe(n_trials: int, variance_across_trials: float) -> float:
 def probabilistic_sharpe_ratio(
     observed_sr: float,
     benchmark_sr: float,
-    n_obs: int,
+    n_obs: float,
     skew: float,
     kurtosis: float,
 ) -> float:
     """Probabilistic Sharpe Ratio: P(true SR > benchmark_sr).
 
     ``observed_sr`` and ``benchmark_sr`` are per-observation Sharpe ratios. ``kurtosis``
-    is the non-excess kurtosis (3.0 for a normal distribution).
+    is the non-excess kurtosis (3.0 for a normal distribution). ``n_obs`` is the track
+    length (may be a fractional EFFECTIVE sample size for overlapping labels).
     """
     if n_obs < 2:
         return 0.5
@@ -89,6 +90,7 @@ def deflated_sharpe_ratio(
     returns: npt.ArrayLike,
     n_trials: int,
     variance_across_trials: float | None = None,
+    effective_n: float | None = None,
 ) -> float:
     """Deflated Sharpe Ratio for a per-trade return series.
 
@@ -103,6 +105,11 @@ def deflated_sharpe_ratio(
         Variance of Sharpe ratios across the trials. If ``None``, it is estimated from
         the asymptotic variance of the SR estimator under the observed sample
         (``(1 + 0.5·SR²)/T``), a standard fallback when the per-trial SRs are not tracked.
+    effective_n
+        Optional effective sample size for OVERLAPPING (non-iid) labels. When supplied and
+        ``>= 2`` it REPLACES the nominal ``T`` in the PSR standard-error term (``sqrt(T-1)``),
+        so a smaller effective-N shrinks the evidence and lowers (stricts) the DSR. ``None``
+        keeps the nominal-``T`` behavior unchanged for existing callers.
 
     Returns
     -------
@@ -128,4 +135,9 @@ def deflated_sharpe_ratio(
         variance_across_trials = (1.0 + 0.5 * sr_hat**2) / t
 
     sr0 = expected_max_sharpe(n_trials, variance_across_trials)
-    return probabilistic_sharpe_ratio(sr_hat, sr0, t, skew, kurt)
+    # Overlapping-label honesty: when an effective sample size is provided, use it (not the
+    # inflated nominal T) as the track length in the PSR standard error. Ignore values < 2.
+    n_obs: float = t
+    if effective_n is not None and effective_n >= 2.0:
+        n_obs = float(effective_n)
+    return probabilistic_sharpe_ratio(sr_hat, sr0, n_obs, skew, kurt)

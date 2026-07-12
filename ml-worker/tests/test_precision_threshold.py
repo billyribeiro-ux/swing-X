@@ -94,8 +94,10 @@ def test_selected_tau_lifts_or_maintains_precision_oos() -> None:
 
     tau = select_act_threshold(proba_is, r_is, DEFAULT_COST_PER_TRADE_R)
 
-    prec_tau, recall_tau, n_acted = precision_recall_at(proba_oos, r_oos, tau)
-    prec_half, _, _ = precision_recall_at(proba_oos, r_oos, 0.5)
+    prec_tau, recall_tau, n_acted = precision_recall_at(
+        proba_oos, r_oos, tau, DEFAULT_COST_PER_TRADE_R
+    )
+    prec_half, _, _ = precision_recall_at(proba_oos, r_oos, 0.5, DEFAULT_COST_PER_TRADE_R)
 
     # The chosen threshold must lift or maintain OOS precision versus acting at 0.5.
     assert prec_tau >= prec_half, (
@@ -117,7 +119,7 @@ def test_pure_noise_returns_valid_fields_and_does_not_crash() -> None:
     proba_is, r_is, proba_oos, r_oos = _split_half(proba, r)
 
     tau = select_act_threshold(proba_is, r_is, DEFAULT_COST_PER_TRADE_R)
-    prec, recall, n_acted = precision_recall_at(proba_oos, r_oos, tau)
+    prec, recall, n_acted = precision_recall_at(proba_oos, r_oos, tau, DEFAULT_COST_PER_TRADE_R)
 
     assert 0.0 <= tau <= 1.0
     assert 0.0 <= prec <= 1.0
@@ -140,7 +142,7 @@ def test_select_act_threshold_empty_is_fallback() -> None:
 def test_precision_recall_at_no_acted_is_zero_precision() -> None:
     proba = np.array([0.1, 0.2, 0.3], dtype=np.float64)
     r = np.array([1.0, -1.0, 1.0], dtype=np.float64)
-    prec, recall, n_acted = precision_recall_at(proba, r, tau=0.9)
+    prec, recall, n_acted = precision_recall_at(proba, r, tau=0.9, cost=0.0)
     assert n_acted == 0
     assert prec == 0.0
     assert recall == 0.0
@@ -151,10 +153,24 @@ def test_precision_recall_at_known_counts() -> None:
     # Profitable opportunities overall: rows with R>0 = {1.0(0.5), 2.0(0.9), 0.3(0.2)} = 3.
     proba = np.array([0.5, 0.7, 0.9, 0.2], dtype=np.float64)
     r = np.array([1.0, -1.0, 2.0, 0.3], dtype=np.float64)
-    prec, recall, n_acted = precision_recall_at(proba, r, tau=0.5)
+    prec, recall, n_acted = precision_recall_at(proba, r, tau=0.5, cost=0.0)
     assert n_acted == 3
     assert prec == 2.0 / 3.0
     assert recall == 2.0 / 3.0  # captured 2 of the 3 profitable opportunities
+
+
+def test_precision_recall_at_is_net_of_cost() -> None:
+    """A sub-cost winner (0 < R < cost) is a NET loss and must NOT count as a precision win."""
+    # All four rows act (proba >= tau). Gross (R>0): {0.02, 0.03, 1.0} win, -0.5 loses -> 3/4.
+    # Net of cost=0.05 (R>0.05): only 1.0 clears -> 1/4. The two sub-cost winners flip to losses.
+    proba = np.array([0.9, 0.9, 0.9, 0.9], dtype=np.float64)
+    r = np.array([0.02, 0.03, 1.0, -0.5], dtype=np.float64)
+    gross, _, _ = precision_recall_at(proba, r, tau=0.5, cost=0.0)
+    net, _, n_acted = precision_recall_at(proba, r, tau=0.5, cost=0.05)
+    assert n_acted == 4
+    assert gross == 3.0 / 4.0
+    assert net == 1.0 / 4.0
+    assert net < gross  # cost-awareness strictly removes sub-cost "wins"
 
 
 def test_select_act_threshold_is_deterministic() -> None:
@@ -202,8 +218,8 @@ def test_precision_first_prefers_higher_precision_tau_over_expectancy_max() -> N
     assert tau > 0.55
 
     # And the precision-first choice is strictly more precise on this IS data.
-    prec_new, _, _ = precision_recall_at(proba_is, r_is, tau)
-    prec_legacy, _, _ = precision_recall_at(proba_is, r_is, legacy)
+    prec_new, _, _ = precision_recall_at(proba_is, r_is, tau, DEFAULT_COST_PER_TRADE_R)
+    prec_legacy, _, _ = precision_recall_at(proba_is, r_is, legacy, DEFAULT_COST_PER_TRADE_R)
     assert prec_new > prec_legacy
 
 

@@ -78,3 +78,19 @@ def test_dsr_constant_returns_edge_cases():
     assert deflated_sharpe_ratio(np.ones(50) * 0.1, n_trials=1) == 1.0  # positive constant
     assert deflated_sharpe_ratio(-np.ones(50) * 0.1, n_trials=1) == 0.0  # negative constant
     assert deflated_sharpe_ratio([0.1], n_trials=1) == 0.5  # too short
+
+
+def test_dsr_lower_effective_n_is_stricter():
+    # Overlapping labels -> smaller effective-N. A lower effective_n must shrink the evidence
+    # and LOWER the (positive-edge) DSR toward 0.5, i.e. be stricter than the nominal count.
+    rng = np.random.default_rng(11)
+    returns = rng.normal(loc=0.15, scale=1.0, size=600)
+    dsr_full = deflated_sharpe_ratio(returns, n_trials=10)
+    dsr_eff = deflated_sharpe_ratio(returns, n_trials=10, effective_n=50.0)  # << 600
+    assert dsr_full > 0.5  # genuine positive edge
+    assert dsr_eff < dsr_full  # effective-N deflation is stricter
+    assert 0.0 <= dsr_eff <= 1.0
+
+    # None (default) and sub-2 effective_n keep the nominal-T behavior exactly (opt-in only).
+    assert deflated_sharpe_ratio(returns, n_trials=10, effective_n=None) == dsr_full
+    assert deflated_sharpe_ratio(returns, n_trials=10, effective_n=1.5) == dsr_full
