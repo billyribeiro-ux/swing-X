@@ -55,7 +55,9 @@
       </span>
       <div class="flex flex-col leading-none">
         <span class="num text-sm font-bold tracking-tight text-base-100">swing-X</span>
-        <span class="text-[10px] tracking-wider text-base-400 uppercase">Operator Console</span>
+        <span class="text-[10px] font-semibold tracking-wider text-base-400 uppercase"
+          >Operator Console</span
+        >
       </div>
     </a>
 

@@ -13,7 +13,7 @@
 </script>
 
 <span
-  class="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-medium tracking-wide uppercase {klass} {mono
+  class="inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-semibold tracking-wide uppercase {klass} {mono
     ? 'num'
     : ''}"
 >
